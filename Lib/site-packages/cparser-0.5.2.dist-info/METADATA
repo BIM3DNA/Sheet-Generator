@@ -1,0 +1,109 @@
+Metadata-Version: 2.3
+Name: cparser
+Version: 0.5.2
+Summary: C Parser written in pure Python
+Keywords: parser,GLR,C
+Author-email: "Typhoon HIL, Inc" <office@typhoon-hil.com>
+Maintainer-email: "Typhoon HIL, Inc" <office@typhoon-hil.com>
+Requires-Python: >=3.8
+Description-Content-Type: text/x-rst
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Information Technology
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Software Development :: Interpreters
+Classifier: Topic :: Software Development :: Compilers
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Requires-Dist: parglare>=0.16,<0.17
+Requires-Dist: ruff ; extra == "dev"
+Requires-Dist: flit ; extra == "dev"
+Requires-Dist: ruff ; extra == "test"
+Requires-Dist: coverage ; extra == "test"
+Requires-Dist: coveralls ; extra == "test"
+Requires-Dist: pytest ; extra == "test"
+Project-URL: Changelog, https://github.com/typhoon-hil/cparser/blob/master/CHANGELOG.md
+Project-URL: Homepage, https://github.com/typhoon-hil/cparser
+Project-URL: Repository, https://github.com/typhoon-hil/cparser
+Provides-Extra: dev
+Provides-Extra: test
+
+
+A C parser based on `parglare <https://github.com/igordejanovic/parglare/>`_ - a pure Python scannerless LR/GLR parser.
+
+Quick intro
+-----------
+
+**cparser** is a parser for C language. This example shows how to
+collect all IDs from a simple C code.
+
+.. code:: python
+
+    from cparser import CParser
+    from cparser.visitor import ASTVisitor
+
+    code = """
+    typedef struct {
+        int element;
+        int weight;
+    } Atom;
+
+    Atom helium;
+    """
+
+    class IDVisitor(ASTVisitor):
+        """Visitor that collects all identifiers in the code."""
+
+        def visit_id(self, node):
+            print(node.value)
+            return node
+
+    parser = CParser()
+    ast = parser.parse(code)
+
+    visitor = IDVisitor()
+    visitor.visit(ast)
+
+    # Output should look like this:
+    # element
+    # weight
+    # Atom
+    # Atom
+    # helium
+
+
+Installation
+------------
+
+- Stable version:
+
+.. code:: shell
+
+    $ pip install cparser
+
+
+- Development version:
+
+.. code:: shell
+
+    $ git clone https://github.com/typhoon-hil/cparser.git
+    $ pip install -e cparser
+
+Licence
+-------
+
+MIT
+
+Python versions
+---------------
+
+Tested with 3.6-3.9
+

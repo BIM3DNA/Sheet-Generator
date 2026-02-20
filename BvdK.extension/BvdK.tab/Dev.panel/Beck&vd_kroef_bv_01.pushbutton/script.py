@@ -1918,7 +1918,7 @@ all_schedules = FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements()
 fittings_master = next(s for s in all_schedules if s.Name == "Geberit PE fittingen")
 pipes_master = next(s for s in all_schedules if s.Name == "Geberit PE leidingen")
 
-t = Transaction(doc, "Duplicate & Configure Geberit Schedules")
+t = Transaction(doc, "Duplicate & Configure Schedules")
 t.Start()
 
 sheet_code = sheet.SheetNumber
