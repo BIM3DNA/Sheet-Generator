@@ -130,7 +130,7 @@ doc = __revit__.ActiveUIDocument.Document
 
 VERBOSE = False
 ANNOTATE_3D = True
-ANNOTATE_3D_MODE = "TAG"
+ANNOTATE_3D_MODE = "TEXT"
 DUPLICATE_ONLY_RELEVANT_SCHEDULES = True
 SKIP_EMPTY_SCHEDULES = True
 
@@ -258,6 +258,19 @@ def _activate_view(uidoc, view):
         return True
     except Exception:
         return False
+
+
+def ui_yield(ms=150):
+    """Let Revit process UI messages so RequestViewChange/ActiveView actually takes effect."""
+    try:
+        import System
+        from System.Windows.Forms import Application
+
+        Application.DoEvents()
+        System.Threading.Thread.Sleep(ms)
+        Application.DoEvents()
+    except Exception:
+        pass
 
 
 def ensure_view_is_active(uidoc, doc, view, retries=5, delay_ms=120):
@@ -414,10 +427,7 @@ def get_tag_role_for_element(elem):
     cat_id = elem.Category.Id.IntegerValue
     if cat_id == int(BuiltInCategory.OST_PipeCurves):
         return "pipe"
-    if cat_id == int(BuiltInCategory.OST_PipeFitting):
-        return "fitting"
-    if cat_id == int(BuiltInCategory.OST_PipeAccessory):
-        return "accessory"
+    # disable 3D tagging for fittings/accessories and all other categories
     return None
 
 
@@ -425,10 +435,35 @@ def create_3d_text_fallback(doc, view3d, elem, point, prefab_code_str):
     text_type = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
     if not text_type:
         return
-    opts = TextNoteOptions(text_type.Id)
-    category_name = elem.Category.Name if elem.Category else "Unknown"
+    role = get_tag_role_for_element(elem)
     type_name = get_element_type_name(elem)
-    label = "{} | {} | {}".format(category_name, type_name, prefab_code_str)
+    if role == "pipe":
+        d = (
+            get_param_display(elem, "Outside Diameter")
+            or get_param_display(elem, "Diameter")
+            or "-"
+        )
+        l = get_param_display(elem, "Length") or "-"
+        label = u"\u00D8{} / L={} | {}".format(d, l, prefab_code_str)
+    elif role == "fitting":
+        s = (
+            get_param_display(elem, "Size")
+            or get_param_display(elem, "Outside Diameter")
+            or get_param_display(elem, "Diameter")
+            or "-"
+        )
+        label = "Fitting {} | {}".format(s, prefab_code_str)
+    elif role == "accessory":
+        desc = get_param_display(elem, "Description") or type_name or "Accessory"
+        s = (
+            get_param_display(elem, "Size")
+            or get_param_display(elem, "Diameter")
+            or "-"
+        )
+        label = "Acc {} {} | {}".format(s, desc or "", prefab_code_str)
+    else:
+        label = "{} | {}".format(type_name, prefab_code_str)
+    opts = TextNoteOptions(text_type.Id)
     TextNote.Create(doc, view3d.Id, point, label, opts)
 
 
@@ -436,10 +471,39 @@ def annotate_3d_view(doc, view3d, scanned_elems, prefab_code_str, source_view):
     if not ANNOTATE_3D:
         return 0
 
-    tag_type_ids = get_3d_tag_type_ids(doc, source_view)
     x_step = 0.08
     y_step = 0.04
     created_3d = 0
+    text_mode = str(ANNOTATE_3D_MODE or "").upper() == "TEXT"
+
+    if text_mode:
+        for idx, elem in enumerate(scanned_elems):
+            role = get_tag_role_for_element(elem)
+            if role is None:
+                continue
+            if get_element_comment_code(elem) != prefab_code_str:
+                continue
+
+            point = get_element_annotation_point(elem, view3d)
+            point = XYZ(
+                point.X + ((idx % 4) * x_step),
+                point.Y + ((idx % 3) * y_step),
+                point.Z,
+            )
+            try:
+                require_modifiable(doc, "annotate_3d_view.TextNote")
+                create_3d_text_fallback(doc, view3d, elem, point, prefab_code_str)
+                created_3d += 1
+            except Exception as ex:
+                print(
+                    "3D text skipped for element {}: {} ({})".format(
+                        elem.Id.IntegerValue, ex, ex.__class__.__name__
+                    )
+                )
+        print("3D tags created: {}".format(created_3d))
+        return created_3d
+
+    tag_type_ids = get_3d_tag_type_ids(doc, source_view)
 
     for idx, elem in enumerate(scanned_elems):
         role = get_tag_role_for_element(elem)
@@ -448,7 +512,7 @@ def annotate_3d_view(doc, view3d, scanned_elems, prefab_code_str, source_view):
         if get_element_comment_code(elem) != prefab_code_str:
             continue
 
-        tag_type_id = tag_type_ids.get(role)
+        tag_type_id = tag_type_ids.get("pipe")
         if tag_type_id is None:
             continue
 
@@ -484,7 +548,7 @@ def annotate_3d_view(doc, view3d, scanned_elems, prefab_code_str, source_view):
             )
             if ANNOTATE_3D_MODE == "TEXT":
                 try:
-                    _assert_doc_modifiable(doc)
+                    require_modifiable(doc, "annotate_3d_view.TextFallback")
                     create_3d_text_fallback(doc, view3d, elem, point, prefab_code_str)
                 except Exception as fallback_ex:
                     print(
@@ -711,6 +775,43 @@ def find_schedule_view_by_name(doc, name):
 
 def get_param_str(elem, name):
     return get_inst_param(elem, name) or get_type_param(elem, name) or ""
+
+
+def get_param_display(elem, param_name, fallback=""):
+    """Return human-readable parameter value. Works for doubles using AsValueString()."""
+    if not elem:
+        return fallback
+    p = elem.LookupParameter(param_name)
+    if not p:
+        try:
+            t = elem.Document.GetElement(elem.GetTypeId())
+            if t:
+                p = t.LookupParameter(param_name)
+        except Exception:
+            p = None
+
+    if not p:
+        return fallback
+
+    try:
+        s = p.AsValueString()
+        if s:
+            return s
+    except Exception:
+        pass
+
+    try:
+        if p.StorageType == StorageType.Double:
+            mm = p.AsDouble() * 304.8
+            return "{} mm".format(int(round(mm)))
+        if p.StorageType == StorageType.Integer:
+            return str(p.AsInteger())
+        if p.StorageType == StorageType.String:
+            return p.AsString() or fallback
+    except Exception:
+        pass
+
+    return fallback
 
 
 def detect_systems(doc, element_ids):
@@ -2658,30 +2759,6 @@ def run_sheet_creation_workflow(
                 require_modifiable(doc, "Prefab - Schedules / PlaceSchedule")
                 ScheduleSheetInstance.Create(doc, sheet.Id, sched_id, XYZ(x, y, 0))
 
-        if view3d is not None:
-            prev_view = uidoc.ActiveView
-            if view3d.IsTemplate:
-                print("3D tagging aborted: view is a template")
-            elif isinstance(view3d, View3D) and view3d.IsPerspective:
-                print("3D tagging aborted: perspective 3D cannot be tagged")
-            else:
-                ok = ensure_view_is_active(uidoc, doc, view3d)
-                if not ok:
-                    print(
-                        "WARNING: Could not activate 3D view; skipping 3D tags."
-                    )
-                else:
-                    with Tx(doc, "Prefab - Place 3D Tags"):
-                        require_modifiable(doc, "Prefab - Place 3D Tags (tx start)")
-                        annotate_3d_view(
-                            doc, view3d, scanned_elems, base_code, source_view
-                        )
-            try:
-                _activate_view(uidoc, prev_view)
-                doc.Regenerate()
-            except Exception:
-                pass
-
         with Tx(doc, "Center Views and Schedules on Sheet"):
             require_modifiable(doc, "Center Views and Schedules on Sheet (tx start)")
             viewports = (
@@ -2692,6 +2769,40 @@ def run_sheet_creation_workflow(
                 vp.SetBoxCenter(tb_center)
 
         tg.Assimilate()
+
+        # ---- Phase B: annotate 3D AFTER creation is committed ----
+        if ANNOTATE_3D and view3d:
+            prev_view = uidoc.ActiveView
+            if view3d.IsTemplate:
+                print("3D tagging aborted: view is a template")
+            elif isinstance(view3d, View3D) and view3d.IsPerspective:
+                print("3D tagging aborted: perspective 3D cannot be tagged")
+            else:
+                try:
+                    uidoc.RequestViewChange(view3d)
+                    ui_yield(250)
+                    uidoc.ActiveView = view3d
+                    ui_yield(250)
+                except Exception as ex:
+                    print("WARNING: Could not activate 3D view: {}".format(ex))
+
+                try:
+                    with Tx(doc, "Prefab - Place 3D Tags (post-commit)"):
+                        require_modifiable(
+                            doc, "Prefab - Place 3D Tags (post-commit tx start)"
+                        )
+                        annotate_3d_view(
+                            doc, view3d, scanned_elems, base_code, source_view
+                        )
+                except Exception as ex:
+                    print("3D tagging failed post-commit: {}".format(ex))
+
+            try:
+                _activate_view(uidoc, prev_view)
+                ui_yield(120)
+                doc.Regenerate()
+            except Exception:
+                pass
     except Exception as ex:
         print("Sheet workflow failed: {}".format(ex))
         try:
