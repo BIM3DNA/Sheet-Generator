@@ -129,6 +129,10 @@ uidoc = __revit__.ActiveUIDocument
 doc = __revit__.ActiveUIDocument.Document
 
 VERBOSE = False
+ANNOTATE_3D = True
+ANNOTATE_3D_MODE = "TAG"
+DUPLICATE_ONLY_RELEVANT_SCHEDULES = True
+SKIP_EMPTY_SCHEDULES = True
 
 
 def debug(*args):
@@ -163,6 +167,55 @@ def rollback_transaction(tx):
         pass
 
 
+class Tx(object):
+    def __init__(self, doc, name):
+        self.doc = doc
+        self.name = name
+        self.t = None
+
+    def __enter__(self):
+        self.t = Transaction(self.doc, self.name)
+        self.t.Start()
+        return self.t
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            try:
+                if self.t.HasStarted():
+                    self.t.RollBack()
+            except Exception:
+                pass
+            return False
+        else:
+            try:
+                self.t.Commit()
+            except Exception:
+                try:
+                    self.t.RollBack()
+                except Exception:
+                    pass
+                raise
+            return True
+
+
+def require_modifiable(doc, where):
+    if doc.IsReadOnly:
+        raise Exception("DOC READONLY at: {}".format(where))
+    if not doc.IsModifiable:
+        raise Exception(
+            "DOC NOT MODIFIABLE at: {} (no open transaction)".format(where)
+        )
+
+
+def _assert_doc_not_readonly(doc, where="unknown"):
+    if doc.IsReadOnly:
+        raise Exception("DOC READONLY at: {}".format(where))
+
+
+def _assert_doc_modifiable(doc, where="unknown"):
+    require_modifiable(doc, where)
+
+
 def set_instance_comment(elem, prefab_code):
     p = elem.LookupParameter("Comments")
     if p and not p.IsReadOnly:
@@ -190,6 +243,260 @@ def get_inst_param(elem, name):
 
 def is_view3d_perspective(v):
     return isinstance(v, View3D) and v.IsPerspective
+
+
+def _activate_view(uidoc, view):
+    """Force Revit to lock ownerDBViewId context for view-owned element creation (tags, detail items, etc.)."""
+    try:
+        uidoc.ActiveView = view
+        return True
+    except Exception:
+        pass
+
+    try:
+        uidoc.RequestViewChange(view)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_view_is_active(uidoc, doc, view, retries=5, delay_ms=120):
+    try:
+        from System.Windows.Forms import Application as WinFormsApplication
+    except Exception:
+        WinFormsApplication = None
+
+    for _ in range(retries):
+        if _activate_view(uidoc, view):
+            try:
+                if WinFormsApplication:
+                    WinFormsApplication.DoEvents()
+            except Exception:
+                pass
+            try:
+                doc.Regenerate()
+            except Exception:
+                pass
+            try:
+                System.Threading.Thread.Sleep(delay_ms)
+            except Exception:
+                pass
+            try:
+                if uidoc.ActiveView and uidoc.ActiveView.Id == view.Id:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def get_element_annotation_point(elem, view=None):
+    try:
+        loc = elem.Location
+        if hasattr(loc, "Curve") and loc.Curve:
+            return loc.Curve.Evaluate(0.5, True)
+        if hasattr(loc, "Point") and loc.Point:
+            return loc.Point
+    except Exception:
+        pass
+    try:
+        bbox = elem.get_BoundingBox(view) if view else elem.get_BoundingBox(None)
+        if bbox:
+            return XYZ(
+                (bbox.Min.X + bbox.Max.X) / 2.0,
+                (bbox.Min.Y + bbox.Max.Y) / 2.0,
+                (bbox.Min.Z + bbox.Max.Z) / 2.0,
+            )
+    except Exception:
+        pass
+    return XYZ(0, 0, 0)
+
+
+def get_element_type_name(elem):
+    try:
+        elem_type = elem.Document.GetElement(elem.GetTypeId())
+        if elem_type and hasattr(elem_type, "Name"):
+            return elem_type.Name or ""
+    except Exception:
+        pass
+    return ""
+
+
+def get_element_comment_code(elem):
+    return normalize_code(get_inst_param(elem, "Comments") or "")
+
+
+def ensure_orthographic_3d_view(doc, view3d):
+    if not isinstance(view3d, View3D):
+        return view3d
+    try:
+        if not view3d.IsPerspective:
+            return view3d
+    except Exception:
+        return view3d
+
+    vft = None
+    for candidate in FilteredElementCollector(doc).OfClass(ViewFamilyType):
+        if candidate.ViewFamily == ViewFamily.ThreeDimensional:
+            vft = candidate
+            break
+    if not vft:
+        raise Exception("No 3D ViewFamilyType found")
+
+    new3d = View3D.CreateIsometric(doc, vft.Id)
+    try:
+        new3d.Name = view3d.Name + " - ORTHO"
+    except Exception:
+        pass
+    return new3d
+
+
+def get_existing_plan_tag_type_ids(doc, source_view):
+    tag_type_ids = {}
+    tag_category_map = {
+        int(BuiltInCategory.OST_PipeTags): "pipe",
+    }
+    fitting_tag_bic = getattr(BuiltInCategory, "OST_PipeFittingTags", None)
+    if fitting_tag_bic is not None:
+        tag_category_map[int(fitting_tag_bic)] = "fitting"
+    accessory_tag_bic = getattr(BuiltInCategory, "OST_PipeAccessoryTags", None)
+    if accessory_tag_bic is not None:
+        tag_category_map[int(accessory_tag_bic)] = "accessory"
+
+    for tag in FilteredElementCollector(
+        doc, source_view.Id
+    ).WhereElementIsNotElementType():
+        try:
+            if not tag.Category:
+                continue
+            role = tag_category_map.get(tag.Category.Id.IntegerValue)
+            if not role or role in tag_type_ids:
+                continue
+            tag_type_ids[role] = tag.GetTypeId()
+        except Exception:
+            continue
+    return tag_type_ids
+
+
+def get_loaded_tag_type_ids(doc, existing_type_ids):
+    tag_type_ids = dict(existing_type_ids)
+    family_symbols = FilteredElementCollector(doc).OfClass(FamilySymbol).ToElements()
+    category_role_map = {
+        int(BuiltInCategory.OST_PipeTags): "pipe",
+    }
+    fitting_tag_bic = getattr(BuiltInCategory, "OST_PipeFittingTags", None)
+    if fitting_tag_bic is not None:
+        category_role_map[int(fitting_tag_bic)] = "fitting"
+    accessory_tag_bic = getattr(BuiltInCategory, "OST_PipeAccessoryTags", None)
+    if accessory_tag_bic is not None:
+        category_role_map[int(accessory_tag_bic)] = "accessory"
+
+    for symbol in family_symbols:
+        try:
+            if not symbol.Category:
+                continue
+            role = category_role_map.get(symbol.Category.Id.IntegerValue)
+            if role and role not in tag_type_ids:
+                tag_type_ids[role] = symbol.Id
+        except Exception:
+            continue
+    return tag_type_ids
+
+
+def get_3d_tag_type_ids(doc, source_view):
+    return get_loaded_tag_type_ids(
+        doc, get_existing_plan_tag_type_ids(doc, source_view)
+    )
+
+
+def get_tag_role_for_element(elem):
+    if not elem or not elem.Category:
+        return None
+    cat_id = elem.Category.Id.IntegerValue
+    if cat_id == int(BuiltInCategory.OST_PipeCurves):
+        return "pipe"
+    if cat_id == int(BuiltInCategory.OST_PipeFitting):
+        return "fitting"
+    if cat_id == int(BuiltInCategory.OST_PipeAccessory):
+        return "accessory"
+    return None
+
+
+def create_3d_text_fallback(doc, view3d, elem, point, prefab_code_str):
+    text_type = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+    if not text_type:
+        return
+    opts = TextNoteOptions(text_type.Id)
+    category_name = elem.Category.Name if elem.Category else "Unknown"
+    type_name = get_element_type_name(elem)
+    label = "{} | {} | {}".format(category_name, type_name, prefab_code_str)
+    TextNote.Create(doc, view3d.Id, point, label, opts)
+
+
+def annotate_3d_view(doc, view3d, scanned_elems, prefab_code_str, source_view):
+    if not ANNOTATE_3D:
+        return 0
+
+    tag_type_ids = get_3d_tag_type_ids(doc, source_view)
+    x_step = 0.08
+    y_step = 0.04
+    created_3d = 0
+
+    for idx, elem in enumerate(scanned_elems):
+        role = get_tag_role_for_element(elem)
+        if role is None:
+            continue
+        if get_element_comment_code(elem) != prefab_code_str:
+            continue
+
+        tag_type_id = tag_type_ids.get(role)
+        if tag_type_id is None:
+            continue
+
+        point = get_element_annotation_point(elem, view3d)
+        point = XYZ(
+            point.X + ((idx % 4) * x_step),
+            point.Y + ((idx % 3) * y_step),
+            point.Z,
+        )
+        try:
+            _assert_doc_modifiable(doc)
+            ref = Reference(elem)
+            tag = IndependentTag.Create(
+                doc,
+                view3d.Id,
+                ref,
+                False,
+                TagMode.TM_ADDBY_CATEGORY,
+                TagOrientation.Horizontal,
+                point,
+            )
+            try:
+                _assert_doc_modifiable(doc)
+                tag.ChangeTypeId(tag_type_id)
+            except Exception:
+                pass
+            created_3d += 1
+        except Exception as ex:
+            print(
+                "3D tag skipped for element {}: {} ({})".format(
+                    elem.Id.IntegerValue, ex, ex.__class__.__name__
+                )
+            )
+            if ANNOTATE_3D_MODE == "TEXT":
+                try:
+                    _assert_doc_modifiable(doc)
+                    create_3d_text_fallback(doc, view3d, elem, point, prefab_code_str)
+                except Exception as fallback_ex:
+                    print(
+                        "3D text fallback skipped for element {}: {} ({})".format(
+                            elem.Id.IntegerValue,
+                            fallback_ex,
+                            fallback_ex.__class__.__name__,
+                        )
+                    )
+
+    print("3D tags created: {}".format(created_3d))
+    return created_3d
 
 
 def safe_duplicate_view(doc, view, opt, label="About to duplicate view"):
@@ -252,6 +559,7 @@ def safe_duplicate_view(doc, view, opt, label="About to duplicate view"):
             )
         )
 
+    require_modifiable(doc, "safe_duplicate_view.Duplicate")
     return view.Duplicate(opt)
 
 
@@ -372,52 +680,22 @@ def duplicate_or_recreate_plan_view(
 
 
 SCHEDULE_TEMPLATES = {
-    "geberit_pe": {
-        "pipes": "Geberit PE leidingen - PREFAB -1",
-        "fittings": "Geberit PE fittingen - PREFAB -1",
-    },
-    "geberit_silent": {
-        "pipes": "Geberit PE Silent leidingen - PREFAB -1",
-        "fittings": "Geberit PE Silent fittingen - PREFAB -1",
-    },
-    "wavin_tigris": {
-        "pipes": "Wavin Tigris Pipe Schedule -1",
-        "fittings": "Wavin Tigris Pipe Fitting Schedule",
-        "flex": "Wavin Tigris Flexible Pipe Schedule -2",
-    },
-    "wavin_wafix_pp": {
-        "pipes": "Wavin Wafix PP Pipes",
-        "fittings_bom": "Wavin Wafix PP Pipe Fittings BOM -1",
-        "accessory_bom": "Wavin Wafix PP Pipe Accessory BOM -1",
-    },
-    "wavin_wafix_pvc": {
-        "pipes": "Wavin WafixPVC Pipes",
-        "fittings": "Wavin WafixPVC Pipe Fittings",
-    },
-    "pipe_accessory": {
-        "schedule": "Pipe Accessory Schedule - PREFAB -1",
-    },
-    "plumbing_fixture": {
-        "schedule": "Plumbing Fixture Schedule - PREFAB -2",
-    },
-    "geberit_pluvia": {
-        "trechters": "Geberit Pluvia trechters - PREFAB",
-        "flex": "Geberit Pluvia flexible aansluitslang - PREFAB",
-    },
-    "duofix": {
-        "bedieningsplaten": "Duofix bedieningsplaten - PREFAB",
-        "elementen": "Duofix elementen - PREFAB -1",
-    },
-    "geberit_montage": {
-        "schedule": "Geberit Montage - PREFAB -1",
-    },
+    "GEBERIT_PE_PIPES": ["Geberit PE leidingen - PREFAB -1"],
+    "GEBERIT_PE_FITTINGS": ["Geberit PE fittingen - PREFAB -1"],
+    "GEBERIT_SILENT_PIPES": ["Geberit PE Silent leidingen - PREFAB -1"],
+    "GEBERIT_SILENT_FITTINGS": ["Geberit PE Silent fittingen - PREFAB -1"],
+    "WAVIN_TIGRIS_PIPES": ["Wavin Tigris Pipe Schedule -1"],
+    "WAVIN_TIGRIS_FITTINGS": ["Wavin Tigris Pipe Fitting Schedule"],
+    "WAVIN_TIGRIS_FLEX": ["Wavin Tigris Flexible Pipe Schedule -2"],
+    "WAVIN_WAFIX_PP_PIPES": ["Wavin Wafix PP Pipes"],
+    "WAVIN_WAFIX_PP_FITTINGS": ["Wavin Wafix PP Pipe Fittings BOM -1"],
+    "PIPE_ACCESSORIES": ["Pipe Accessory Schedule - PREFAB -1"],
+    "PLUMBING_FIXTURES": ["Plumbing Fixture Schedule - PREFAB -2"],
 }
 
 
 def normalize_schedule_name(name):
-    return " ".join(
-        name.lower().replace("_", " ").replace("-", " ").split()
-    )
+    return " ".join(name.lower().replace("_", " ").replace("-", " ").split())
 
 
 def find_schedule_view_by_name(doc, name):
@@ -431,72 +709,59 @@ def find_schedule_view_by_name(doc, name):
     return None
 
 
-def detect_prefab_systems(elements):
+def get_param_str(elem, name):
+    return get_inst_param(elem, name) or get_type_param(elem, name) or ""
+
+
+def detect_systems(doc, element_ids):
     detected = set()
-    has_pipe_accessories = False
-    has_plumbing_fixtures = False
-    has_flex_pipes = False
-    manufacturers = set()
-    product_series = set()
-
-    for elem in elements:
-        if not elem.Category:
+    for item in element_ids:
+        elem = doc.GetElement(item) if isinstance(item, ElementId) else item
+        if not elem or not elem.Category:
             continue
+
         cat_id = elem.Category.Id.IntegerValue
-        family_name = ""
-        try:
-            if isinstance(elem, FamilyInstance) and elem.Symbol and elem.Symbol.Family:
-                family_name = elem.Symbol.Family.Name or ""
-        except Exception:
-            family_name = ""
-        family_name_lc = family_name.lower()
-        man = (get_type_param(elem, "Manufacturer") or get_inst_param(elem, "Manufacturer") or "").strip()
-        prod = (get_type_param(elem, "product_series") or get_inst_param(elem, "product_series") or "").strip()
-        man_lc = man.lower()
-        prod_lc = prod.lower()
-        if man:
-            manufacturers.add(man)
-        if prod:
-            product_series.add(prod)
+        manufacturer = get_param_str(elem, "Manufacturer").strip().lower()
+        product_series = get_param_str(elem, "product_series").strip().lower()
+        description = get_param_str(elem, "Description").strip().lower()
+        model = get_param_str(elem, "Model").strip().lower()
+        signals = " ".join([product_series, description, model])
 
-        if cat_id == int(BuiltInCategory.OST_PipeAccessory):
-            has_pipe_accessories = True
-        elif cat_id == int(BuiltInCategory.OST_PlumbingFixtures):
-            has_plumbing_fixtures = True
+        if cat_id == int(BuiltInCategory.OST_PipeCurves):
+            if "wavin" in manufacturer and "tigris" in product_series:
+                detected.add("WAVIN_TIGRIS_PIPES")
+            if "wavin" in manufacturer and (
+                "wafix" in product_series or "wafix pp" in product_series
+            ):
+                detected.add("WAVIN_WAFIX_PP_PIPES")
+            if "geberit" in manufacturer and ("silent" in signals or "db20" in signals):
+                detected.add("GEBERIT_SILENT_PIPES")
+            elif "geberit" in manufacturer and "pe" in signals:
+                detected.add("GEBERIT_PE_PIPES")
+
+        elif cat_id == int(BuiltInCategory.OST_PipeFitting):
+            if "wavin" in manufacturer and "tigris" in product_series:
+                detected.add("WAVIN_TIGRIS_FITTINGS")
+            if "wavin" in manufacturer and (
+                "wafix" in product_series or "wafix pp" in product_series
+            ):
+                detected.add("WAVIN_WAFIX_PP_FITTINGS")
+            if "geberit" in manufacturer and ("silent" in signals or "db20" in signals):
+                detected.add("GEBERIT_SILENT_FITTINGS")
+            elif "geberit" in manufacturer and "pe" in signals:
+                detected.add("GEBERIT_PE_FITTINGS")
+
         elif cat_id == int(BuiltInCategory.OST_FlexPipeCurves):
-            has_flex_pipes = True
+            if "wavin" in manufacturer and "tigris" in product_series:
+                detected.add("WAVIN_TIGRIS_FLEX")
 
-        if "wavin" in man_lc:
-            if prod_lc == "tigris":
-                detected.add("wavin_tigris")
-            if prod_lc == "wafix pp" or "wafix" in prod_lc:
-                detected.add("wavin_wafix_pp")
-            if "wafix pvc" in prod_lc or "wafixpvc" in prod_lc:
-                detected.add("wavin_wafix_pvc")
+        elif cat_id == int(BuiltInCategory.OST_PipeAccessory):
+            detected.add("PIPE_ACCESSORIES")
 
-        if "geberit" in man_lc:
-            if "silent" in family_name_lc or "silent" in prod_lc:
-                detected.add("geberit_silent")
-            if "pluvia" in family_name_lc or "pluvia" in prod_lc:
-                detected.add("geberit_pluvia")
-            if "duofix" in family_name_lc or "duofix" in prod_lc:
-                detected.add("duofix")
-            if "montage" in family_name_lc or "montage" in prod_lc:
-                detected.add("geberit_montage")
-            if "pe" in family_name_lc or prod_lc == "pe":
-                detected.add("geberit_pe")
+        elif cat_id == int(BuiltInCategory.OST_PlumbingFixtures):
+            detected.add("PLUMBING_FIXTURES")
 
-    if has_pipe_accessories:
-        detected.add("pipe_accessory")
-    if has_plumbing_fixtures:
-        detected.add("plumbing_fixture")
-
-    if "Wavin" in manufacturers and "Tigris" in product_series:
-        detected.add("wavin_tigris")
-    if "Wavin" in manufacturers and any("Wafix" in x for x in product_series):
-        detected.add("wavin_wafix_pp")
-
-    return detected, has_flex_pipes
+    return detected
 
 
 def apply_prefab_filter_to_schedule(vs, prefab_code):
@@ -529,41 +794,74 @@ def apply_prefab_filter_to_schedule(vs, prefab_code):
         f = sd.GetFilter(i)
         if f.FieldId == comment_field_id:
             sd.RemoveFilter(i)
-    sd.AddFilter(ScheduleFilter(comment_field_id, ScheduleFilterType.Equal, prefab_code))
+    sd.AddFilter(
+        ScheduleFilter(comment_field_id, ScheduleFilterType.Equal, prefab_code)
+    )
+
+
+def get_schedule_body_row_count(vs):
+    try:
+        table_data = vs.GetTableData()
+        body = table_data.GetSectionData(SectionType.Body)
+        return body.NumberOfRows
+    except Exception as ex:
+        print("Schedule row count failed for '{}': {}".format(vs.Name, ex))
+        return None
 
 
 def duplicate_schedules_for_systems(doc, detected_systems, prefab_code):
     created = []
+    required_templates = []
+    seen_templates = set()
     for syskey in sorted(detected_systems):
-        if syskey not in SCHEDULE_TEMPLATES:
+        template_names = SCHEDULE_TEMPLATES.get(syskey)
+        if not template_names:
             print("No schedule template mapping for {}".format(syskey))
             continue
-        for role, sched_name in SCHEDULE_TEMPLATES[syskey].items():
-            src = find_schedule_view_by_name(doc, sched_name)
-            if not src:
-                print("Schedule template not found: '{}'".format(sched_name))
+        for sched_name in template_names:
+            if sched_name in seen_templates:
                 continue
+            seen_templates.add(sched_name)
+            required_templates.append(sched_name)
 
-            t = Transaction(doc, "Duplicate schedule: {}".format(sched_name))
-            try:
-                t.Start()
-                print("About to duplicate schedule: {}".format(sched_name))
-                new_id = src.Duplicate(ViewDuplicateOption.Duplicate)
-                new_vs = doc.GetElement(new_id)
-                target_name = "{} {}".format(sched_name, prefab_code)
-                final_name = target_name
-                suffix = 2
-                while find_schedule_view_by_name(doc, final_name):
-                    final_name = "{} ({})".format(target_name, suffix)
-                    suffix += 1
-                new_vs.Name = final_name
-                apply_prefab_filter_to_schedule(new_vs, prefab_code)
-                t.Commit()
-                created.append(new_vs.Id)
-            except Exception as ex:
-                rollback_transaction(t)
-                print("Schedule duplication failed for '{}': {}".format(sched_name, ex))
-                continue
+    target_schedule_names = set(required_templates)
+    for sched_name in sorted(target_schedule_names):
+        src = find_schedule_view_by_name(doc, sched_name)
+        if not src:
+            print("Schedule template not found: '{}'".format(sched_name))
+            continue
+
+        try:
+            require_modifiable(doc, "duplicate_schedules_for_systems.start")
+            print("About to duplicate schedule: {}".format(sched_name))
+            require_modifiable(doc, "duplicate_schedules_for_systems.Duplicate")
+            new_id = src.Duplicate(ViewDuplicateOption.Duplicate)
+            new_vs = doc.GetElement(new_id)
+            target_name = "{} {}".format(sched_name, prefab_code)
+            final_name = target_name
+            suffix = 2
+            while find_schedule_view_by_name(doc, final_name):
+                final_name = "{} ({})".format(target_name, suffix)
+                suffix += 1
+            require_modifiable(doc, "duplicate_schedules_for_systems.Name")
+            new_vs.Name = final_name
+            apply_prefab_filter_to_schedule(new_vs, prefab_code)
+
+            if SKIP_EMPTY_SCHEDULES:
+                doc.Regenerate()
+                row_count = get_schedule_body_row_count(new_vs)
+                if row_count == 0:
+                    require_modifiable(
+                        doc, "duplicate_schedules_for_systems.DeleteEmpty"
+                    )
+                    doc.Delete(new_vs.Id)
+                    print("Skipped empty schedule: '{}'".format(final_name))
+                    continue
+
+            created.append(new_vs.Id)
+        except Exception as ex:
+            print("Schedule duplication failed for '{}': {}".format(sched_name, ex))
+            continue
     return created
 
 
@@ -2013,12 +2311,15 @@ if gathered_elements is None or len(gathered_elements) == 0:
     MessageBox.Show("No elements were gathered. Operation cancelled.", "Error")
     sys.exit("Operation cancelled by the user.")
 
-filtered_elements = filter_relevant_elements(gathered_elements)
+scanned_ids = List[ElementId]([e.Id for e in gathered_elements if e is not None])
+scanned_elems = [doc.GetElement(eid) for eid in scanned_ids]
+
+filtered_elements = filter_relevant_elements(scanned_elems)
 if len(filtered_elements) == 0:
     MessageBox.Show("No relevant elements found in the selected region.", "Error")
     sys.exit("Operation cancelled by the user.")
 
-result = show_element_editor(filtered_elements, region_elements=gathered_elements)
+result = show_element_editor(filtered_elements, region_elements=scanned_elems)
 if result is None:
     sys.exit("Operation cancelled by the user.")
 
@@ -2092,10 +2393,7 @@ try:
         elem = doc.GetElement(ElementId(eid))
         if not elem:
             continue
-        p = elem.LookupParameter("Comments")
-        if not p or p.IsReadOnly:
-            continue
-        p.Set(code_norm)
+        set_instance_comment(elem, code_norm)
     t.Commit()
 except Exception:
     rollback_transaction(t)
@@ -2124,12 +2422,12 @@ if not result.get("TextNotePlaced", False):
         rollback_transaction(ttn)
         raise
 
-region_min, region_max = get_region_bounding_box(gathered_elements)
+region_min, region_max = get_region_bounding_box(scanned_elems)
 boundary_source_view = uidoc.ActiveView
 
 
 def run_sheet_creation_workflow(
-    base_code, gathered_elements, region_min, region_max, source_view
+    base_code, scanned_ids, scanned_elems, region_min, region_max, source_view
 ):
     source_plan = resolve_dup_source_plan_view(
         doc, source_view, preferred_name_contains="V00 - C00_Prefab Sets"
@@ -2199,9 +2497,13 @@ def run_sheet_creation_workflow(
                 self.lb.Items.Add(fam + " - " + type_name)
             self.Controls.Add(self.lb)
 
-            ok = Button(Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 300))
+            ok = Button(
+                Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 300)
+            )
             ca = Button(
-                Text="Cancel", DialogResult=DialogResult.Cancel, Location=Point(100, 300)
+                Text="Cancel",
+                DialogResult=DialogResult.Cancel,
+                Location=Point(100, 300),
             )
             self.Controls.Add(ok)
             self.Controls.Add(ca)
@@ -2217,120 +2519,134 @@ def run_sheet_creation_workflow(
         return
 
     title_block = all_tbs[picker.lb.SelectedIndex]
+    titleblock_type_id = title_block.Id
+    if not titleblock_type_id:
+        print("User cancelled titleblock selection.")
+        return
+
     tg = TransactionGroup(doc, "Prefab Sheet Creation")
     try:
         tg.Start()
 
-        tx = Transaction(doc, "Create Cropped Plan View")
-        try:
-            tx.Start()
+        new_view = None
+        view3d = None
+        sheet = None
+        tb_center = None
+
+        with Tx(doc, "Prefab - Create Views"):
+            require_modifiable(doc, "Prefab - Create Views (tx start)")
             new_view, route_used = duplicate_or_recreate_plan_view(
                 doc, orig, duplicate_option, base_code
             )
             print("Plan view created via: {}".format(route_used))
+            require_modifiable(doc, "Prefab - Create Views / ViewTemplateId")
             new_view.ViewTemplateId = ElementId.InvalidElementId
+            require_modifiable(doc, "Prefab - Create Views / Discipline")
             new_view.Discipline = ViewDiscipline.Coordination
+            require_modifiable(doc, "Prefab - Create Views / Scale")
             new_view.Scale = 25
 
             bb = BoundingBoxXYZ()
             bb.Min = region_min
             bb.Max = region_max
             bb.Transform = orig_trans
+            require_modifiable(doc, "Prefab - Create Views / CropBoxActive")
             new_view.CropBoxActive = True
+            require_modifiable(doc, "Prefab - Create Views / CropBoxVisible")
             new_view.CropBoxVisible = True
             annoParam = new_view.get_Parameter(
                 BuiltInParameter.VIEWER_ANNOTATION_CROP_ACTIVE
             )
             if annoParam and not annoParam.IsReadOnly:
+                require_modifiable(doc, "Prefab - Create Views / AnnotationCrop")
                 annoParam.Set(1)
+            require_modifiable(doc, "Prefab - Create Views / CropBox")
             new_view.CropBox = bb
             param = new_view.get_Parameter(BuiltInParameter.VIEWER_CROP_REGION_VISIBLE)
             if param and not param.IsReadOnly:
+                require_modifiable(doc, "Prefab - Create Views / CropRegionVisible")
                 param.Set(0)
             cat_drag_controls = doc.Settings.Categories.get_Item(
                 BuiltInCategory.OST_ConnectorElem
             )
             if cat_drag_controls and new_view.CanCategoryBeHidden(cat_drag_controls.Id):
+                require_modifiable(doc, "Prefab - Create Views / HideConnectors")
                 new_view.SetCategoryHidden(cat_drag_controls.Id, True)
-            tx.Commit()
-        except Exception:
-            rollback_transaction(tx)
-            raise
 
-        sheet = None
-        tb_center = None
-        for base in {base_code}:
-            if base in existing_numbers:
-                raise Exception("Sheet already exists: {}".format(base))
-
-            t3 = Transaction(doc, "Create Sheet and 3D")
+            all3ds = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
+            v3d_type = next(
+                v for v in all3ds if v.ViewFamily == ViewFamily.ThreeDimensional
+            )
+            require_modifiable(doc, "Prefab - Create Views / Create3D")
+            view3d = View3D.CreateIsometric(doc, v3d_type.Id)
+            view3d = ensure_orthographic_3d_view(doc, view3d)
             try:
-                t3.Start()
-                sheet = ViewSheet.Create(doc, title_block.Id)
-                sheet.SheetNumber = base
-                sheet.Name = "Prefab " + base
+                require_modifiable(doc, "Prefab - Create Views / 3DName")
+                view3d.Name = "{} - Sheet".format(base_code)
+            except Exception as ex:
+                print("3D view naming failed for {}: {}".format(base_code, ex))
+            require_modifiable(doc, "Prefab - Create Views / 3DDiscipline")
+            view3d.Discipline = ViewDiscipline.Architectural
+            require_modifiable(doc, "Prefab - Create Views / 3DScale")
+            view3d.Scale = 25
+            section_bb = BoundingBoxXYZ()
+            section_bb.Min = region_min
+            section_bb.Max = region_max
+            require_modifiable(doc, "Prefab - Create Views / SetSectionBox")
+            view3d.SetSectionBox(section_bb)
+            require_modifiable(doc, "Prefab - Create Views / IsSectionBoxActive")
+            view3d.IsSectionBoxActive = True
+            section_box = view3d.GetSectionBox()
+            if section_box:
+                require_modifiable(doc, "Prefab - Create Views / SectionBoxEnabled")
+                section_box.Enabled = True
 
-                titleblock_inst = next(
-                    (
-                        e
-                        for e in FilteredElementCollector(doc, sheet.Id)
-                        .OfClass(FamilyInstance)
-                        .ToElements()
-                        if e.Symbol.Id == title_block.Id
-                    ),
-                    None,
-                )
-                tb_bb = titleblock_inst.get_BoundingBox(sheet) if titleblock_inst else None
-                if not tb_bb:
-                    raise Exception("Could not retrieve title block bounding box.")
+        with Tx(doc, "Prefab - Create Sheet"):
+            if base_code in existing_numbers:
+                raise Exception("Sheet already exists: {}".format(base_code))
+            require_modifiable(doc, "Prefab - Create Sheet / ViewSheet.Create")
+            sheet = ViewSheet.Create(doc, titleblock_type_id)
+            require_modifiable(doc, "Prefab - Create Sheet / SheetNumber")
+            sheet.SheetNumber = base_code
+            require_modifiable(doc, "Prefab - Create Sheet / SheetName")
+            sheet.Name = "Prefab " + base_code
 
-                tb_center = XYZ(
-                    (tb_bb.Min.X + tb_bb.Max.X) / 2,
-                    (tb_bb.Min.Y + tb_bb.Max.Y) / 2,
-                    0,
-                )
-                Viewport.Create(doc, sheet.Id, new_view.Id, tb_center)
+            titleblock_inst = next(
+                (
+                    e
+                    for e in FilteredElementCollector(doc, sheet.Id)
+                    .OfClass(FamilyInstance)
+                    .ToElements()
+                    if e.Symbol.Id == titleblock_type_id
+                ),
+                None,
+            )
+            tb_bb = titleblock_inst.get_BoundingBox(sheet) if titleblock_inst else None
+            if not tb_bb:
+                raise Exception("Could not retrieve title block bounding box.")
 
-                all3ds = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
-                v3d_type = next(
-                    v for v in all3ds if v.ViewFamily == ViewFamily.ThreeDimensional
-                )
-                view3d = View3D.CreateIsometric(doc, v3d_type.Id)
-                try:
-                    view3d.Name = "{} - Sheet".format(base)
-                except Exception as ex:
-                    print("3D view naming failed for {}: {}".format(base, ex))
-                view3d.Discipline = ViewDiscipline.Architectural
-                view3d.Scale = 25
-                section_bb = BoundingBoxXYZ()
-                section_bb.Min = region_min
-                section_bb.Max = region_max
-                view3d.SetSectionBox(section_bb)
-                view3d.IsSectionBoxActive = True
-                section_box = view3d.GetSectionBox()
-                if section_box:
-                    section_box.Enabled = True
-                Viewport.Create(
-                    doc,
-                    sheet.Id,
-                    view3d.Id,
-                    XYZ(tb_center.X + 0.25, tb_center.Y + 0.25, 0),
-                )
-                t3.Commit()
-            except Exception:
-                rollback_transaction(t3)
-                raise
+            tb_center = XYZ(
+                (tb_bb.Min.X + tb_bb.Max.X) / 2,
+                (tb_bb.Min.Y + tb_bb.Max.Y) / 2,
+                0,
+            )
+            require_modifiable(doc, "Prefab - Create Sheet / PlanViewport")
+            Viewport.Create(doc, sheet.Id, new_view.Id, tb_center)
+            require_modifiable(doc, "Prefab - Create Sheet / 3DViewport")
+            Viewport.Create(
+                doc,
+                sheet.Id,
+                view3d.Id,
+                XYZ(tb_center.X + 0.25, tb_center.Y + 0.25, 0),
+            )
 
-        detected_systems, has_flex_pipes = detect_prefab_systems(gathered_elements)
-        if has_flex_pipes and "wavin_tigris" in detected_systems:
-            pass
-        created_schedule_ids = duplicate_schedules_for_systems(
-            doc, detected_systems, base_code
-        )
+        detected_systems = detect_systems(doc, scanned_ids)
+        with Tx(doc, "Prefab - Schedules"):
+            require_modifiable(doc, "Prefab - Schedules (tx start)")
+            created_schedule_ids = duplicate_schedules_for_systems(
+                doc, detected_systems, base_code
+            )
 
-        place_tx = Transaction(doc, "Place Schedules on Sheet")
-        try:
-            place_tx.Start()
             uMin, uMax = sheet.Outline.Min.U, sheet.Outline.Max.U
             vMin, vMax = sheet.Outline.Min.V, sheet.Outline.Max.V
             w, h = (uMax - uMin), (vMax - vMin)
@@ -2339,24 +2655,41 @@ def run_sheet_creation_workflow(
             spacing = 0.12 * h
             for idx, sched_id in enumerate(created_schedule_ids):
                 y = y_start - idx * spacing
+                require_modifiable(doc, "Prefab - Schedules / PlaceSchedule")
                 ScheduleSheetInstance.Create(doc, sheet.Id, sched_id, XYZ(x, y, 0))
-            place_tx.Commit()
-        except Exception:
-            rollback_transaction(place_tx)
-            raise
 
-        move_tx = Transaction(doc, "Center Views and Schedules on Sheet")
-        try:
-            move_tx.Start()
+        if view3d is not None:
+            prev_view = uidoc.ActiveView
+            if view3d.IsTemplate:
+                print("3D tagging aborted: view is a template")
+            elif isinstance(view3d, View3D) and view3d.IsPerspective:
+                print("3D tagging aborted: perspective 3D cannot be tagged")
+            else:
+                ok = ensure_view_is_active(uidoc, doc, view3d)
+                if not ok:
+                    print(
+                        "WARNING: Could not activate 3D view; skipping 3D tags."
+                    )
+                else:
+                    with Tx(doc, "Prefab - Place 3D Tags"):
+                        require_modifiable(doc, "Prefab - Place 3D Tags (tx start)")
+                        annotate_3d_view(
+                            doc, view3d, scanned_elems, base_code, source_view
+                        )
+            try:
+                _activate_view(uidoc, prev_view)
+                doc.Regenerate()
+            except Exception:
+                pass
+
+        with Tx(doc, "Center Views and Schedules on Sheet"):
+            require_modifiable(doc, "Center Views and Schedules on Sheet (tx start)")
             viewports = (
                 FilteredElementCollector(doc, sheet.Id).OfClass(Viewport).ToElements()
             )
             for vp in viewports:
+                require_modifiable(doc, "Center Views and Schedules / SetBoxCenter")
                 vp.SetBoxCenter(tb_center)
-            move_tx.Commit()
-        except Exception:
-            rollback_transaction(move_tx)
-            raise
 
         tg.Assimilate()
     except Exception as ex:
@@ -2374,7 +2707,8 @@ if not proceed_with_sheet_creation:
 else:
     run_sheet_creation_workflow(
         code_norm,
-        gathered_elements,
+        scanned_ids,
+        scanned_elems,
         region_min,
         region_max,
         boundary_source_view,
