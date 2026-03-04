@@ -141,6 +141,432 @@ def debug(*args):
 # ==================================================
 
 
+def normalize_code(raw):
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    s = s.lower().replace("prefab", "").strip()
+    for ch in [":", "-", "_"]:
+        if s.startswith(ch):
+            s = s[1:].strip()
+    s = " ".join(s.split())
+    m = re.search(r"(\d+(?:\.\d+)*)", s)
+    return m.group(1) if m else ""
+
+
+def rollback_transaction(tx):
+    if not tx:
+        return
+    try:
+        tx.RollBack()
+    except Exception:
+        pass
+
+
+def set_instance_comment(elem, prefab_code):
+    p = elem.LookupParameter("Comments")
+    if p and not p.IsReadOnly:
+        p.Set(prefab_code)
+
+
+def get_type_param(elem, name):
+    try:
+        t = elem.Document.GetElement(elem.GetTypeId())
+        if not t:
+            return None
+        p = t.LookupParameter(name)
+        return p.AsString() if p else None
+    except Exception:
+        return None
+
+
+def get_inst_param(elem, name):
+    try:
+        p = elem.LookupParameter(name)
+        return p.AsString() if p else None
+    except Exception:
+        return None
+
+
+def is_view3d_perspective(v):
+    return isinstance(v, View3D) and v.IsPerspective
+
+
+def safe_duplicate_view(doc, view, opt, label="About to duplicate view"):
+    primary_view_id = "n/a"
+    if hasattr(view, "PrimaryViewId"):
+        try:
+            primary_view_id = view.PrimaryViewId.IntegerValue
+        except Exception:
+            primary_view_id = "n/a"
+    is_temp = False
+    try:
+        is_temp = view.IsTemplate
+    except Exception:
+        pass
+    msg = "DUPLICATE VIEW REQUEST: name='{}' id={} type={} isTemplate={}".format(
+        view.Name, view.Id.IntegerValue, view.ViewType, is_temp
+    )
+    if isinstance(view, View3D):
+        try:
+            msg += " isPerspective={}".format(view.IsPerspective)
+        except Exception:
+            pass
+    print(msg)
+    TaskDialog.Show(
+        "SheetGen Debug",
+        "{}\nId: {}\nName: {}\nViewType: {}\nIsTemplate: {}\nPrimaryViewId: {}".format(
+            label,
+            view.Id.IntegerValue,
+            view.Name,
+            view.ViewType,
+            is_temp,
+            primary_view_id,
+        ),
+    )
+
+    if is_temp:
+        raise Exception("Refusing to duplicate a template view: {}".format(view.Name))
+
+    if is_view3d_perspective(view):
+        vft = None
+        for x in FilteredElementCollector(doc).OfClass(ViewFamilyType):
+            if x.ViewFamily == ViewFamily.ThreeDimensional:
+                vft = x
+                break
+        if not vft:
+            raise Exception("No 3D ViewFamilyType found")
+        new3d = View3D.CreateIsometric(doc, vft.Id)
+        new3d.Name = view.Name + " - ISO"
+        return new3d.Id
+
+    can = True
+    try:
+        can = view.CanViewBeDuplicated(opt)
+    except Exception:
+        pass
+    if not can:
+        raise Exception(
+            "View cannot be duplicated (CanViewBeDuplicated=False): {}".format(
+                view.Name
+            )
+        )
+
+    return view.Duplicate(opt)
+
+
+def resolve_dup_source_plan_view(doc, candidate_view, preferred_name_contains=None):
+    def get_primary_view(view):
+        if view is None:
+            return None
+        if hasattr(view, "GetPrimaryViewId"):
+            try:
+                pid = view.GetPrimaryViewId()
+                if pid and pid != ElementId.InvalidElementId:
+                    view = doc.GetElement(pid)
+            except Exception:
+                pass
+        return view
+
+    def is_primary_view_plan(view):
+        if not isinstance(view, ViewPlan):
+            return False
+        if view.IsTemplate:
+            return False
+        if hasattr(view, "GetPrimaryViewId"):
+            try:
+                return view.GetPrimaryViewId() == ElementId.InvalidElementId
+            except Exception:
+                return True
+        return True
+
+    candidate = get_primary_view(candidate_view)
+    if is_primary_view_plan(candidate):
+        return candidate
+
+    all_view_plans = list(FilteredElementCollector(doc).OfClass(ViewPlan).ToElements())
+
+    if preferred_name_contains:
+        preferred_name_contains_lc = preferred_name_contains.lower()
+        for v in all_view_plans:
+            if preferred_name_contains_lc not in v.Name.lower():
+                continue
+            if is_primary_view_plan(v):
+                return v
+
+    for v in all_view_plans:
+        if is_primary_view_plan(v):
+            return v
+
+    return None
+
+
+def duplicate_or_recreate_plan_view(
+    doc, source_view, dup_option_preferred, desired_name
+):
+    source_name = source_view.Name if source_view else "<None>"
+    if not isinstance(source_view, ViewPlan) or source_view.IsTemplate:
+        raise Exception(
+            "Invalid source view for plan duplication: {}".format(source_name)
+        )
+
+    options = [
+        ViewDuplicateOption.WithDetailing,
+        ViewDuplicateOption.Duplicate,
+        ViewDuplicateOption.AsDependent,
+    ]
+    if dup_option_preferred in options:
+        options = [dup_option_preferred] + [
+            o for o in options if o != dup_option_preferred
+        ]
+
+    for opt in options:
+        try:
+            new_id = safe_duplicate_view(
+                doc,
+                source_view,
+                opt,
+                "About to duplicate: plan source ({})".format(opt),
+            )
+            v = doc.GetElement(new_id)
+            try:
+                v.Name = desired_name
+            except Exception:
+                pass
+            return v, opt
+        except InvalidOperationException:
+            continue
+
+    vfts = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
+    floor_vft = next(vft for vft in vfts if vft.ViewFamily == ViewFamily.FloorPlan)
+
+    level_id = source_view.GenLevel.Id
+    new_plan = ViewPlan.Create(doc, floor_vft.Id, level_id)
+    try:
+        new_plan.Name = desired_name
+    except Exception:
+        pass
+
+    new_plan.Scale = source_view.Scale
+    new_plan.Discipline = source_view.Discipline
+
+    ids_to_copy = List[ElementId]()
+    for el in (
+        FilteredElementCollector(doc, source_view.Id)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    ):
+        if el.Category and el.Category.CategoryType == CategoryType.Annotation:
+            ids_to_copy.Add(el.Id)
+
+    if ids_to_copy.Count > 0:
+        ElementTransformUtils.CopyElements(
+            source_view,
+            ids_to_copy,
+            new_plan,
+            Transform.Identity,
+            CopyPasteOptions(),
+        )
+
+    return new_plan, "Created"
+
+
+SCHEDULE_TEMPLATES = {
+    "geberit_pe": {
+        "pipes": "Geberit PE leidingen - PREFAB -1",
+        "fittings": "Geberit PE fittingen - PREFAB -1",
+    },
+    "geberit_silent": {
+        "pipes": "Geberit PE Silent leidingen - PREFAB -1",
+        "fittings": "Geberit PE Silent fittingen - PREFAB -1",
+    },
+    "wavin_tigris": {
+        "pipes": "Wavin Tigris Pipe Schedule -1",
+        "fittings": "Wavin Tigris Pipe Fitting Schedule",
+        "flex": "Wavin Tigris Flexible Pipe Schedule -2",
+    },
+    "wavin_wafix_pp": {
+        "pipes": "Wavin Wafix PP Pipes",
+        "fittings_bom": "Wavin Wafix PP Pipe Fittings BOM -1",
+        "accessory_bom": "Wavin Wafix PP Pipe Accessory BOM -1",
+    },
+    "wavin_wafix_pvc": {
+        "pipes": "Wavin WafixPVC Pipes",
+        "fittings": "Wavin WafixPVC Pipe Fittings",
+    },
+    "pipe_accessory": {
+        "schedule": "Pipe Accessory Schedule - PREFAB -1",
+    },
+    "plumbing_fixture": {
+        "schedule": "Plumbing Fixture Schedule - PREFAB -2",
+    },
+    "geberit_pluvia": {
+        "trechters": "Geberit Pluvia trechters - PREFAB",
+        "flex": "Geberit Pluvia flexible aansluitslang - PREFAB",
+    },
+    "duofix": {
+        "bedieningsplaten": "Duofix bedieningsplaten - PREFAB",
+        "elementen": "Duofix elementen - PREFAB -1",
+    },
+    "geberit_montage": {
+        "schedule": "Geberit Montage - PREFAB -1",
+    },
+}
+
+
+def normalize_schedule_name(name):
+    return " ".join(
+        name.lower().replace("_", " ").replace("-", " ").split()
+    )
+
+
+def find_schedule_view_by_name(doc, name):
+    for vs in FilteredElementCollector(doc).OfClass(ViewSchedule):
+        if vs.Name == name:
+            return vs
+    target = normalize_schedule_name(name)
+    for vs in FilteredElementCollector(doc).OfClass(ViewSchedule):
+        if normalize_schedule_name(vs.Name) == target:
+            return vs
+    return None
+
+
+def detect_prefab_systems(elements):
+    detected = set()
+    has_pipe_accessories = False
+    has_plumbing_fixtures = False
+    has_flex_pipes = False
+    manufacturers = set()
+    product_series = set()
+
+    for elem in elements:
+        if not elem.Category:
+            continue
+        cat_id = elem.Category.Id.IntegerValue
+        family_name = ""
+        try:
+            if isinstance(elem, FamilyInstance) and elem.Symbol and elem.Symbol.Family:
+                family_name = elem.Symbol.Family.Name or ""
+        except Exception:
+            family_name = ""
+        family_name_lc = family_name.lower()
+        man = (get_type_param(elem, "Manufacturer") or get_inst_param(elem, "Manufacturer") or "").strip()
+        prod = (get_type_param(elem, "product_series") or get_inst_param(elem, "product_series") or "").strip()
+        man_lc = man.lower()
+        prod_lc = prod.lower()
+        if man:
+            manufacturers.add(man)
+        if prod:
+            product_series.add(prod)
+
+        if cat_id == int(BuiltInCategory.OST_PipeAccessory):
+            has_pipe_accessories = True
+        elif cat_id == int(BuiltInCategory.OST_PlumbingFixtures):
+            has_plumbing_fixtures = True
+        elif cat_id == int(BuiltInCategory.OST_FlexPipeCurves):
+            has_flex_pipes = True
+
+        if "wavin" in man_lc:
+            if prod_lc == "tigris":
+                detected.add("wavin_tigris")
+            if prod_lc == "wafix pp" or "wafix" in prod_lc:
+                detected.add("wavin_wafix_pp")
+            if "wafix pvc" in prod_lc or "wafixpvc" in prod_lc:
+                detected.add("wavin_wafix_pvc")
+
+        if "geberit" in man_lc:
+            if "silent" in family_name_lc or "silent" in prod_lc:
+                detected.add("geberit_silent")
+            if "pluvia" in family_name_lc or "pluvia" in prod_lc:
+                detected.add("geberit_pluvia")
+            if "duofix" in family_name_lc or "duofix" in prod_lc:
+                detected.add("duofix")
+            if "montage" in family_name_lc or "montage" in prod_lc:
+                detected.add("geberit_montage")
+            if "pe" in family_name_lc or prod_lc == "pe":
+                detected.add("geberit_pe")
+
+    if has_pipe_accessories:
+        detected.add("pipe_accessory")
+    if has_plumbing_fixtures:
+        detected.add("plumbing_fixture")
+
+    if "Wavin" in manufacturers and "Tigris" in product_series:
+        detected.add("wavin_tigris")
+    if "Wavin" in manufacturers and any("Wafix" in x for x in product_series):
+        detected.add("wavin_wafix_pp")
+
+    return detected, has_flex_pipes
+
+
+def apply_prefab_filter_to_schedule(vs, prefab_code):
+    try:
+        sd = vs.Definition
+    except Exception as ex:
+        print("Cannot access schedule definition '{}': {}".format(vs.Name, ex))
+        return
+
+    comments_param = ElementId(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+    comment_field = None
+    for f_id in sd.GetFieldOrder():
+        sf = sd.GetField(f_id)
+        if sf.ParameterId == comments_param:
+            comment_field = sf
+            break
+
+    if comment_field is None:
+        try:
+            cm_sched_field = next(
+                f for f in sd.GetSchedulableFields() if f.ParameterId == comments_param
+            )
+            comment_field = sd.AddField(cm_sched_field)
+        except Exception as ex:
+            print("Comments field missing for schedule '{}': {}".format(vs.Name, ex))
+            return
+
+    comment_field_id = comment_field.FieldId
+    for i in reversed(range(sd.GetFilterCount())):
+        f = sd.GetFilter(i)
+        if f.FieldId == comment_field_id:
+            sd.RemoveFilter(i)
+    sd.AddFilter(ScheduleFilter(comment_field_id, ScheduleFilterType.Equal, prefab_code))
+
+
+def duplicate_schedules_for_systems(doc, detected_systems, prefab_code):
+    created = []
+    for syskey in sorted(detected_systems):
+        if syskey not in SCHEDULE_TEMPLATES:
+            print("No schedule template mapping for {}".format(syskey))
+            continue
+        for role, sched_name in SCHEDULE_TEMPLATES[syskey].items():
+            src = find_schedule_view_by_name(doc, sched_name)
+            if not src:
+                print("Schedule template not found: '{}'".format(sched_name))
+                continue
+
+            t = Transaction(doc, "Duplicate schedule: {}".format(sched_name))
+            try:
+                t.Start()
+                print("About to duplicate schedule: {}".format(sched_name))
+                new_id = src.Duplicate(ViewDuplicateOption.Duplicate)
+                new_vs = doc.GetElement(new_id)
+                target_name = "{} {}".format(sched_name, prefab_code)
+                final_name = target_name
+                suffix = 2
+                while find_schedule_view_by_name(doc, final_name):
+                    final_name = "{} ({})".format(target_name, suffix)
+                    suffix += 1
+                new_vs.Name = final_name
+                apply_prefab_filter_to_schedule(new_vs, prefab_code)
+                t.Commit()
+                created.append(new_vs.Id)
+            except Exception as ex:
+                rollback_transaction(t)
+                print("Schedule duplication failed for '{}': {}".format(sched_name, ex))
+                continue
+    return created
+
+
 # --- Boundary Selection Functions ---
 class DetailLineSelectionFilter(ISelectionFilter):
     def AllowElement(self, elem):
@@ -1598,16 +2024,35 @@ if result is None:
 
 uidoc.Selection.SetElementIds(List[ElementId]())
 
-baseCode = result["TextNote"]
+post_editor_dialog = TaskDialog("Sheet Generator")
+post_editor_dialog.MainInstruction = "Choose what to do next."
+post_editor_dialog.MainContent = "You can continue with sheet creation or stop after applying tags/text in the current view."
+post_editor_dialog.AddCommandLink(
+    TaskDialogCommandLinkId.CommandLink1,
+    "Proceed with sheet creation (duplicate view + create sheet + place schedules)",
+)
+post_editor_dialog.AddCommandLink(
+    TaskDialogCommandLinkId.CommandLink2,
+    "Only place tags/text in current view and stop (no sheet)",
+)
+post_editor_dialog.CommonButtons = TaskDialogCommonButtons.Cancel
+post_editor_choice = post_editor_dialog.Show()
+proceed_with_sheet_creation = post_editor_choice == TaskDialogResult.CommandLink1
+
+text_note_display = (result.get("TextNote") or "").strip()
+code_norm = normalize_code(text_note_display)
+if not code_norm:
+    MessageBox.Show("Enter a valid prefab code such as 5.5.5.", "Invalid Prefab Code")
+    sys.exit("Invalid prefab code")
+
+baseCode = code_norm
 for eData in result["Elements"]:
     if eData["Category"] == "Pipe Fittings":
         eData["NewCode"] = baseCode
 
 # --- Renumber Pipes based on region order (sorted left-to-right, bottom-to-up) ---
 if not result.get("TextNotePlaced", False):
-    base_raw = result.get("TextNote", "").strip()
-    m = re.search(r"([\d\.]+)", base_raw)
-    base = m.group(1) if m else "0"
+    base = code_norm
 
     pipe_entries = []
     for idx, eData in enumerate(result["Elements"]):
@@ -1635,31 +2080,26 @@ if not result.get("TextNotePlaced", False):
 
 # --- Update the elements' "Comments" from the DataGridView ---
 t = Transaction(doc, "Update Comments")
-t.Start()
-for eData in result["Elements"]:
-    # skip rows where Id is missing or not an integer
-    id_val = eData.get("Id")
-    try:
-        eid = int(str(id_val))
-    except (TypeError, ValueError):
-        continue
+try:
+    t.Start()
+    for eData in result["Elements"]:
+        id_val = eData.get("Id")
+        try:
+            eid = int(str(id_val))
+        except (TypeError, ValueError):
+            continue
 
-    elem = doc.GetElement(ElementId(eid))
-    if not elem:
-        continue
-    # get the Comments parameter
-    p = elem.LookupParameter("Comments")
-    if not p or p.IsReadOnly:
-        continue
-
-    # if this is a fitting, force it to the base sheet code
-    if eData["Category"] == "Pipe Fittings":
-        # result ["TextNote"] holds exactly the text you placed e.g. "5.1.1"
-        p.Set(result["TextNote"])
-    else:
-        # pipes & tags keep their full NewCode
-        p.Set(str(eData["NewCode"]))
-t.Commit()
+        elem = doc.GetElement(ElementId(eid))
+        if not elem:
+            continue
+        p = elem.LookupParameter("Comments")
+        if not p or p.IsReadOnly:
+            continue
+        p.Set(code_norm)
+    t.Commit()
+except Exception:
+    rollback_transaction(t)
+    raise
 
 # --- Place the text note if not already placed ---
 if not result.get("TextNotePlaced", False):
@@ -1667,429 +2107,275 @@ if not result.get("TextNotePlaced", False):
     view = doc.ActiveView
     corner = region_min
     ttn = Transaction(doc, "Place Text Note at Region Corner")
-    ttn.Start()
-    nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
-    if nt:
-        opts = TextNoteOptions(nt.Id)
-        TextNote.Create(
-            doc, doc.ActiveView.Id, corner, result.get("TextNote", base), opts
-        )
-    ttn.Commit()
+    try:
+        ttn.Start()
+        nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+        if nt:
+            opts = TextNoteOptions(nt.Id)
+            TextNote.Create(
+                doc,
+                doc.ActiveView.Id,
+                corner,
+                text_note_display or code_norm,
+                opts,
+            )
+        ttn.Commit()
+    except Exception:
+        rollback_transaction(ttn)
+        raise
 
 region_min, region_max = get_region_bounding_box(gathered_elements)
+boundary_source_view = uidoc.ActiveView
 
-orig = uidoc.ActiveView
-if orig.ViewType != ViewType.FloorPlan:
-    MessageBox.Show("Active view is not a Floor Plan!", "Error")
-    sys.exit()
 
-# grab the original crop box transform so the region maps to the same coordinate system
-orig_bb = orig.CropBox
-orig_trans = orig_bb.Transform
-
-tx = Transaction(doc, "Create Cropped Plan View")
-tx.Start()
-
-# Duplicate With Detailing so all your pipe-tags (Independent Tag) come over
-new_id = orig.Duplicate(ViewDuplicateOption.WithDetailing)
-new_view = doc.GetElement(new_id)
-
-# remove any view template and set scale to 1:25
-new_view.ViewTemplateId = ElementId.InvalidElementId
-
-# force it to Coordination
-new_view.Discipline = ViewDiscipline.Coordination
-new_view.Scale = 25
-
-# naming, cropping, discipline etc...
-m = re.search(r"([\d\.]+)", result["TextNote"])
-base = m.group(1) if m else result["TextNote"].strip()  # "5.1.1"
-try:
-    new_view.Name = base
-except ArgumentException:
-    MessageBox.Show(
-        "A view named '{0}' already exists!\n\n"
-        "Please pick a different code in the text-node editor.".format(base),
-        "Duplicate View Name",
+def run_sheet_creation_workflow(
+    base_code, gathered_elements, region_min, region_max, source_view
+):
+    source_plan = resolve_dup_source_plan_view(
+        doc, source_view, preferred_name_contains="V00 - C00_Prefab Sets"
     )
-    tx.RollBack()
-    sys.exit("Duplicate View Name")
-# apply region crop using the same transform
-bb = BoundingBoxXYZ()
-bb.Min = region_min
-bb.Max = region_max
-bb.Transform = orig_trans
-
-new_view.CropBoxActive = True
-new_view.CropBoxVisible = True
-# new_view.CropBox = bb
-
-# turn on annotation crop
-annoParam = new_view.get_Parameter(BuiltInParameter.VIEWER_ANNOTATION_CROP_ACTIVE)
-if annoParam and not annoParam.IsReadOnly:
-    annoParam.Set(1)
-
-new_view.CropBox = bb
-
-# Hide crop region controls (but keep border visible)
-param = new_view.get_Parameter(BuiltInParameter.VIEWER_CROP_REGION_VISIBLE)
-if param and not param.IsReadOnly:
-    param.Set(0)
-
-# Hide temporary blue dimensions
-# temp_dim_param = new_view.get_Parameter(BuiltInParameter.VIEWER_TEMP_DIM_VISIBLE)
-# if temp_dim_param and not temp_dim_param.IsReadOnly:
-#     temp_dim_param.Set(0)
-
-# Hide pipe drag handles (blue grip boxes)
-cat_drag_controls = doc.Settings.Categories.get_Item(BuiltInCategory.OST_ConnectorElem)
-if cat_drag_controls and new_view.CanCategoryBeHidden(cat_drag_controls.Id):
-    new_view.SetCategoryHidden(cat_drag_controls.Id, True)
-
-tx.Commit()
-# -----------------------------------------
-# 2) SHOW TITLE-BLOCK PICKER, THEN CREATE SHEET
-# -----------------------------------------
-
-# collect title‑blocks
-all_tbs = list(
-    FilteredElementCollector(doc)
-    .OfCategory(BuiltInCategory.OST_TitleBlocks)
-    .OfClass(FamilySymbol)
-    .ToElements()
-)
-
-if not all_tbs:
-    MessageBox.Show("No title‑block types found.", "Error")
-    sys.exit()
-
-
-class TBPicker(Form):
-    def __init__(self, tbs):
-        self.tbs = tbs
-        self.Text = "Choose a Title‑Block"
-        self.ClientSize = Size(300, 350)
-
-        # ListBox
-        self.lb = ListBox()
-        self.lb.Bounds = Rectangle(10, 10, 280, 280)
-        for sym in tbs:
-            fam = sym.FamilyName
-            type_name = (
-                sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM).AsString() or ""
-            )
-            self.lb.Items.Add(fam + " - " + type_name)
-        self.Controls.Add(self.lb)
-
-        # OK / Cancel
-        ok = Button(Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 300))
-        ca = Button(
-            Text="Cancel", DialogResult=DialogResult.Cancel, Location=Point(100, 300)
+    if source_plan is None:
+        TaskDialog.Show(
+            "Sheet Generator",
+            "No valid primary ViewPlan was found for duplication.",
         )
-        self.Controls.Add(ok)
-        self.Controls.Add(ca)
-        self.AcceptButton = ok
-        self.CancelButton = ca
+        return
 
+    orig = source_plan
 
-existing_sheets = FilteredElementCollector(doc).OfClass(ViewSheet).ToElements()
-existing_numbers = {s.SheetNumber for s in existing_sheets}
+    # grab the original crop box transform so the region maps to the same coordinate system
+    orig_bb = orig.CropBox
+    orig_trans = orig_bb.Transform
 
-# show the picker
-picker = TBPicker(all_tbs)
-if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
-    MessageBox.Show("Sheet creation cancelled.", "Info")
-    sys.exit()
+    duplicate_option = ViewDuplicateOption.WithDetailing
 
-title_block = all_tbs[picker.lb.SelectedIndex]
-
-# ————————————————————————————————
-# 3) Create A3 sheets, skipping duplicates
-# ————————————————————————————————
-
-# b) for each base, only create if it’s not already on a sheet
-for base in {base}:  # e.g. 5.1.1
-    if base in existing_numbers:
-        MessageBox.Show(
-            "Sheet 'prefab {0}' already exists!\n\n"
-            "Please pick a different code in the text-note editor.".format(base),
-            "Duplicate Sheet",
-        )
-        sys.exit("Duplicate sheet number")
-    t3 = Transaction(doc, "Create 3D callout")
-    t3.Start()
-    sheet = ViewSheet.Create(doc, title_block.Id)
-    sheet.SheetNumber = base
-    sheet.Name = "Prefab " + base
-
-    # Get placed title block instance and its bounding box
-    titleblock_inst = next(
-        (
-            e
-            for e in FilteredElementCollector(doc, sheet.Id)
-            .OfClass(FamilyInstance)
-            .ToElements()
-            if e.Symbol.Id == title_block.Id
-        ),
-        None,
-    )
-
-    tb_bb = titleblock_inst.get_BoundingBox(sheet) if titleblock_inst else None
-    if not tb_bb:
-        MessageBox.Show("Could not retrieve title block bounding box.", "Error")
-        sys.exit()
-
-    # Center of the actual debugable area (inner region of the title block)
-    tb_center = XYZ(
-        (tb_bb.Min.X + tb_bb.Max.X) / 2,
-        (tb_bb.Min.Y + tb_bb.Max.Y) / 2,
-        0,
-    )
-
-    # Place the main floor plan view centered in title block region
-    Viewport.Create(doc, sheet.Id, new_view.Id, tb_center)
-
-    # ------------------------------------------
-    # 4) Create & place 3D callout
-    # ------------------------------------------
-    all3ds = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
-    all3d_views = FilteredElementCollector(doc).OfClass(View3D).ToElements()
-    # 1. pick a 3D ViewFamilyType
-    prefix = "{} - Sheet".format(base)
-    existing_count = sum(1 for v in all3d_views if v.Name.startswith(prefix))
-
-    v3d_type = next(v for v in all3ds if v.ViewFamily == ViewFamily.ThreeDimensional)
-
-    # split off the last number of the base code
-    parts = base.split(".")
-    major = ".".join(parts[:-1])
-    last = int(parts[-1])
-    new_last = last + existing_count
-    sheet_suffix = "{}.{}".format(major, new_last)
-
-    # 2. create an isometric 3D view
-    view3d = View3D.CreateIsometric(doc, v3d_type.Id)
-    view3d.Name = "{} - Sheet {}".format(base, sheet_suffix)
-    # force it into the Architectural branch of the browser
-    view3d.Discipline = ViewDiscipline.Architectural
-    view3d.Scale = 25
-
-    # apply your A00_Algemeen 3D View Template
-    tmpl = next(
-        (v for v in all3d_views if v.IsTemplate and v.Name == "S4R_A00_Algemeen_3D"),
-        None,
-    )
-    if tmpl:
-        view3d.ViewTemplateId = tmpl.Id
-
-    param = view3d.get_Parameter(BuiltInParameter.VIEW_DISCIPLINE)
-    if not param.IsReadOnly:
-        param.Set(int(ViewDiscipline.Architectural))
-
-    # 3. use the same region bounding box you computed earlier
-    section_bb = BoundingBoxXYZ()
-    section_bb.Min = region_min
-    section_bb.Max = region_max
-    view3d.SetSectionBox(section_bb)
-
-    view3d.IsSectionBoxActive = True
-    section_box = view3d.GetSectionBox()
-    if section_box:
-        section_box.Enabled = True
-
-    viewport_spacing = 0.25  # adjust as needed for spacing
-    v3d_pos = XYZ(tb_center.X + viewport_spacing, tb_center.Y + viewport_spacing, 0)
-    Viewport.Create(doc, sheet.Id, view3d.Id, v3d_pos)
-
-    t3.Commit()
-
-
-# --- Helper function to find field by name
-def find_schedule_field_by_name(sd, field_name):
-    for f_id in sd.GetFieldOrder():
-        sf = sd.GetField(f_id)
-        if sf.GetName() == field_name:
-            return sf
-    raise Exception("Field not found: {}".format(field_name))
-
-
-# --- Main script
-all_schedules = FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements()
-fittings_master = next(s for s in all_schedules if s.Name == "Geberit PE fittingen")
-pipes_master = next(s for s in all_schedules if s.Name == "Geberit PE leidingen")
-
-t = Transaction(doc, "Duplicate & Configure Schedules")
-t.Start()
-
-sheet_code = sheet.SheetNumber
-tasks = [
-    (fittings_master, False, 0),
-    (pipes_master, True, 1),
-]
-
-for master, is_pipe, idx in tasks:
-    # --- duplicate & rename ---
-    dup_id = master.Duplicate(ViewDuplicateOption.Duplicate)
-    dup = doc.GetElement(dup_id)
-    dup.Name = "{} {}".format(master.Name, sheet_code)
-    # Convert 1.5 mm to internal Revit feet (1 foot = 304.8 mm)
-    target_font = "Arial"
-    target_mm = 1.5
-    target_ft = target_mm / 304.8
-
-    # Search existing text types
-    text_types = FilteredElementCollector(doc).OfClass(TextNoteType).ToElements()
-    matching_type = None
-    for tt in text_types:
+    primary_view_id = "n/a"
+    if hasattr(orig, "GetPrimaryViewId"):
         try:
-            font = tt.get_Parameter(BuiltInParameter.TEXT_FONT).AsString()
-            size = tt.get_Parameter(BuiltInParameter.TEXT_SIZE).AsDouble()
-            if font == target_font and abs(size - target_ft) < 0.001:
-                matching_type = tt
-                break
-        except:
-            continue
+            primary_view_id = orig.GetPrimaryViewId().IntegerValue
+        except Exception:
+            primary_view_id = "n/a"
 
-    # If not found, duplicate the first one and create the target
-    if not matching_type and text_types:
-        source_type = text_types[0]
-        t = Transaction(doc, "Create Arial 1.5mm Text Type")
-        t.Start()
-        new_type_id = source_type.Duplicate("Arial 1.5mm")
-        new_type = doc.GetElement(new_type_id)
-        new_type.get_Parameter(BuiltInParameter.TEXT_FONT).Set(target_font)
-        new_type.get_Parameter(BuiltInParameter.TEXT_SIZE).Set(target_ft)
-        t.Commit()
-        matching_type = new_type
-
-    # Apply it to the schedule view if available
-    if matching_type:
-        dup.TitleTextTypeId = matching_type.Id
-        dup.HeaderTextTypeId = matching_type.Id
-        dup.BodyTextTypeId = matching_type.Id
-
-    sd = dup.Definition
-    # --- if it's a Leidingen (pipes) schedule, change Length field to millimeters ---
-    if is_pipe:
-        for f_id in sd.GetFieldOrder():
-            field = sd.GetField(f_id)
-            if field.GetName().lower().startswith("length"):
-                opts = field.GetFormatOptions()
-                opts.UseDefault = False
-                opts.SetUnitTypeId(UnitTypeId.Millimeters)
-                opts.Accuracy = 0.1
-                field.SetFormatOptions(opts)
-                break
-    comments_param = ElementId(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-
-    # --- find the schedule-field ID that corresponds to "Comments" ---
-    comment_field = None
-    for f_id in sd.GetFieldOrder():
-        sf = sd.GetField(f_id)
-        if sf.ParameterId == comments_param:
-            comment_field = sf
-            break
-
-    # If "Comments" column not found yet, add it
-    if comment_field is None:
-        cm_sched_field = next(
-            f for f in sd.GetSchedulableFields() if f.ParameterId == comments_param
+    duplicate_debug_info = (
+        "Source view before duplicate:\n"
+        "Id: {}\n"
+        "Name: {}\n"
+        "ViewType: {}\n"
+        "IsTemplate: {}\n"
+        "PrimaryViewId: {}".format(
+            orig.Id.IntegerValue,
+            orig.Name,
+            orig.ViewType,
+            orig.IsTemplate,
+            primary_view_id,
         )
-        sf = sd.AddField(cm_sched_field)
-        comment_field = sf
+    )
+    print(duplicate_debug_info)
+    TaskDialog.Show("Sheet Generator Debug", duplicate_debug_info)
+    all_tbs = list(
+        FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_TitleBlocks)
+        .OfClass(FamilySymbol)
+        .ToElements()
+    )
+    if not all_tbs:
+        MessageBox.Show("No title-block types found.", "Error")
+        return
 
-    comment_field_id = comment_field.FieldId
+    class TBPicker(Form):
+        def __init__(self, tbs):
+            self.tbs = tbs
+            self.Text = "Choose a Title-Block"
+            self.ClientSize = Size(300, 350)
 
-    # --- clear out any existing Comments-filters ---
-    for i in reversed(range(sd.GetFilterCount())):
-        f = sd.GetFilter(i)
-        if f.FieldId == comment_field_id:
-            sd.RemoveFilter(i)
+            self.lb = ListBox()
+            self.lb.Bounds = Rectangle(10, 10, 280, 280)
+            for sym in tbs:
+                fam = sym.FamilyName
+                type_name = (
+                    sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM).AsString()
+                    or ""
+                )
+                self.lb.Items.Add(fam + " - " + type_name)
+            self.Controls.Add(self.lb)
 
-    # --- add the new filter (Contains for both pipes and fittings now) ---
-    ftype = ScheduleFilterType.Contains
-    sd.AddFilter(ScheduleFilter(comment_field_id, ftype, sheet_code))
+            ok = Button(Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 300))
+            ca = Button(
+                Text="Cancel", DialogResult=DialogResult.Cancel, Location=Point(100, 300)
+            )
+            self.Controls.Add(ok)
+            self.Controls.Add(ca)
+            self.AcceptButton = ok
+            self.CancelButton = ca
 
-    # --- clear sort fields safely
-    for i in reversed(range(sd.GetSortGroupFieldCount())):
-        sd.RemoveSortGroupField(i)
+    existing_sheets = FilteredElementCollector(doc).OfClass(ViewSheet).ToElements()
+    existing_numbers = {s.SheetNumber for s in existing_sheets}
 
-    # --- add correct sorting based on schedule type
-    if is_pipe:
-        # Leidingen sorting
-        seg_field = find_schedule_field_by_name(sd, "Segment Description")
-        art_field = find_schedule_field_by_name(sd, "Article Nr")
-        od_field = find_schedule_field_by_name(sd, "Outside Diameter")
+    picker = TBPicker(all_tbs)
+    if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
+        MessageBox.Show("Sheet creation cancelled.", "Info")
+        return
 
-        grp1 = ScheduleSortGroupField(seg_field.FieldId, ScheduleSortOrder.Ascending)
-        grp1.ShowHeader = True
-        sd.AddSortGroupField(grp1)
+    title_block = all_tbs[picker.lb.SelectedIndex]
+    tg = TransactionGroup(doc, "Prefab Sheet Creation")
+    try:
+        tg.Start()
 
-        grp2 = ScheduleSortGroupField(art_field.FieldId, ScheduleSortOrder.Ascending)
-        sd.AddSortGroupField(grp2)
+        tx = Transaction(doc, "Create Cropped Plan View")
+        try:
+            tx.Start()
+            new_view, route_used = duplicate_or_recreate_plan_view(
+                doc, orig, duplicate_option, base_code
+            )
+            print("Plan view created via: {}".format(route_used))
+            new_view.ViewTemplateId = ElementId.InvalidElementId
+            new_view.Discipline = ViewDiscipline.Coordination
+            new_view.Scale = 25
 
-        grp3 = ScheduleSortGroupField(od_field.FieldId, ScheduleSortOrder.Ascending)
-        sd.AddSortGroupField(grp3)
+            bb = BoundingBoxXYZ()
+            bb.Min = region_min
+            bb.Max = region_max
+            bb.Transform = orig_trans
+            new_view.CropBoxActive = True
+            new_view.CropBoxVisible = True
+            annoParam = new_view.get_Parameter(
+                BuiltInParameter.VIEWER_ANNOTATION_CROP_ACTIVE
+            )
+            if annoParam and not annoParam.IsReadOnly:
+                annoParam.Set(1)
+            new_view.CropBox = bb
+            param = new_view.get_Parameter(BuiltInParameter.VIEWER_CROP_REGION_VISIBLE)
+            if param and not param.IsReadOnly:
+                param.Set(0)
+            cat_drag_controls = doc.Settings.Categories.get_Item(
+                BuiltInCategory.OST_ConnectorElem
+            )
+            if cat_drag_controls and new_view.CanCategoryBeHidden(cat_drag_controls.Id):
+                new_view.SetCategoryHidden(cat_drag_controls.Id, True)
+            tx.Commit()
+        except Exception:
+            rollback_transaction(tx)
+            raise
 
-        dup.Definition.IsItemized = True
+        sheet = None
+        tb_center = None
+        for base in {base_code}:
+            if base in existing_numbers:
+                raise Exception("Sheet already exists: {}".format(base))
 
-    else:
-        # Fittingen sorting
-        cm_field = find_schedule_field_by_name(sd, "Comments")
-        prod_field = find_schedule_field_by_name(sd, "NLRS_C_code_fabrikant_product")
+            t3 = Transaction(doc, "Create Sheet and 3D")
+            try:
+                t3.Start()
+                sheet = ViewSheet.Create(doc, title_block.Id)
+                sheet.SheetNumber = base
+                sheet.Name = "Prefab " + base
 
-        grp1 = ScheduleSortGroupField(cm_field.FieldId, ScheduleSortOrder.Ascending)
-        grp1.ShowHeader = True
-        sd.AddSortGroupField(grp1)
+                titleblock_inst = next(
+                    (
+                        e
+                        for e in FilteredElementCollector(doc, sheet.Id)
+                        .OfClass(FamilyInstance)
+                        .ToElements()
+                        if e.Symbol.Id == title_block.Id
+                    ),
+                    None,
+                )
+                tb_bb = titleblock_inst.get_BoundingBox(sheet) if titleblock_inst else None
+                if not tb_bb:
+                    raise Exception("Could not retrieve title block bounding box.")
 
-        grp2 = ScheduleSortGroupField(prod_field.FieldId, ScheduleSortOrder.Ascending)
-        sd.AddSortGroupField(grp2)
+                tb_center = XYZ(
+                    (tb_bb.Min.X + tb_bb.Max.X) / 2,
+                    (tb_bb.Min.Y + tb_bb.Max.Y) / 2,
+                    0,
+                )
+                Viewport.Create(doc, sheet.Id, new_view.Id, tb_center)
 
-        dup.Definition.IsItemized = False
+                all3ds = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
+                v3d_type = next(
+                    v for v in all3ds if v.ViewFamily == ViewFamily.ThreeDimensional
+                )
+                view3d = View3D.CreateIsometric(doc, v3d_type.Id)
+                try:
+                    view3d.Name = "{} - Sheet".format(base)
+                except Exception as ex:
+                    print("3D view naming failed for {}: {}".format(base, ex))
+                view3d.Discipline = ViewDiscipline.Architectural
+                view3d.Scale = 25
+                section_bb = BoundingBoxXYZ()
+                section_bb.Min = region_min
+                section_bb.Max = region_max
+                view3d.SetSectionBox(section_bb)
+                view3d.IsSectionBoxActive = True
+                section_box = view3d.GetSectionBox()
+                if section_box:
+                    section_box.Enabled = True
+                Viewport.Create(
+                    doc,
+                    sheet.Id,
+                    view3d.Id,
+                    XYZ(tb_center.X + 0.25, tb_center.Y + 0.25, 0),
+                )
+                t3.Commit()
+            except Exception:
+                rollback_transaction(t3)
+                raise
 
-    # --- place the schedule on the sheet
-    uMin, uMax = sheet.Outline.Min.U, sheet.Outline.Max.U
-    vMin, vMax = sheet.Outline.Min.V, sheet.Outline.Max.V
-    w, h = (uMax - uMin), (vMax - vMin)
-    x = uMin + 0.05 * w
-    y = vMin + (0.05 + 0.3 * idx) * h
+        detected_systems, has_flex_pipes = detect_prefab_systems(gathered_elements)
+        if has_flex_pipes and "wavin_tigris" in detected_systems:
+            pass
+        created_schedule_ids = duplicate_schedules_for_systems(
+            doc, detected_systems, base_code
+        )
 
-    ScheduleSheetInstance.Create(doc, sheet.Id, dup.Id, XYZ(x, y, 0))
+        place_tx = Transaction(doc, "Place Schedules on Sheet")
+        try:
+            place_tx.Start()
+            uMin, uMax = sheet.Outline.Min.U, sheet.Outline.Max.U
+            vMin, vMax = sheet.Outline.Min.V, sheet.Outline.Max.V
+            w, h = (uMax - uMin), (vMax - vMin)
+            x = uMin + 0.05 * w
+            y_start = vMax - 0.35 * h
+            spacing = 0.12 * h
+            for idx, sched_id in enumerate(created_schedule_ids):
+                y = y_start - idx * spacing
+                ScheduleSheetInstance.Create(doc, sheet.Id, sched_id, XYZ(x, y, 0))
+            place_tx.Commit()
+        except Exception:
+            rollback_transaction(place_tx)
+            raise
 
-t.Commit()
+        move_tx = Transaction(doc, "Center Views and Schedules on Sheet")
+        try:
+            move_tx.Start()
+            viewports = (
+                FilteredElementCollector(doc, sheet.Id).OfClass(Viewport).ToElements()
+            )
+            for vp in viewports:
+                vp.SetBoxCenter(tb_center)
+            move_tx.Commit()
+        except Exception:
+            rollback_transaction(move_tx)
+            raise
 
-# ----------------------------------------
-# 6) CENTER PLAN VIEW, 3D VIEW, AND SCHEDULES ON THE SHEET
-# ----------------------------------------
+        tg.Assimilate()
+    except Exception as ex:
+        print("Sheet workflow failed: {}".format(ex))
+        try:
+            tg.RollBack()
+        except Exception:
+            pass
+        TaskDialog.Show("Sheet Generator", "Sheet creation failed.\n\n{}".format(ex))
+        return
 
-# Start a new transaction to move them
-move_tx = Transaction(doc, "Center Views and Schedules on Sheet")
-move_tx.Start()
 
-# 1. Calculate center of the sheet
-sheet_center = tb_center
-
-# 2. Find all viewports on the sheet and center them
-viewports = FilteredElementCollector(doc, sheet.Id).OfClass(Viewport).ToElements()
-
-for vp in viewports:
-    vp.SetBoxCenter(sheet_center)
-
-# 3. Find all schedules on the sheet and center them nicely stacked
-schedules = (
-    FilteredElementCollector(doc, sheet.Id).OfClass(ScheduleSheetInstance).ToElements()
-)
-
-schedule_offset = 0.15  # Offset down between schedules (adjust if needed)
-normal_schedules = []
-
-for sch in schedules:
-    if sch.IsTitleblockRevisionSchedule:
-        continue
-    normal_schedules.append(sch)
-
-for idx, sch in enumerate(normal_schedules):
-    sch_point = XYZ(sheet_center.X, sheet_center.Y - (idx * schedule_offset), 0)
-    sch.Point = sch_point
-
-move_tx.Commit()
+if not proceed_with_sheet_creation:
+    MessageBox.Show("Tags/text placed. Sheet creation skipped.", "Info")
+else:
+    run_sheet_creation_workflow(
+        code_norm,
+        gathered_elements,
+        region_min,
+        region_max,
+        boundary_source_view,
+    )
