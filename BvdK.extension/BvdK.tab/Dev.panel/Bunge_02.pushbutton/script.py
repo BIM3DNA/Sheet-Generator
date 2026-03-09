@@ -175,7 +175,7 @@ TAGCFG_ACO = dict(
     family="RSen_GA_tag pipe_ACO",
     type=u"RED TypeMark + DN + \u2300",
     leader=True,
-    offset_mm=400,
+    offset_mm=500,
 )
 TAGCFG_VERD = dict(
     family="BvdK_Verdiepingspijl",
@@ -1529,16 +1529,151 @@ def ensure_prefab_text_note_in_view(view, polygon, text_value):
         t.Commit()
 
 
-def get_view_id_for_sheet(doc, source_view, desired_name=None):
+def count_pipe_tags_in_view(doc, view):
     try:
-        if getattr(source_view, "IsTemplate", False):
-            return None, "Source view is a template"
+        return (
+            FilteredElementCollector(doc, view.Id)
+            .OfCategory(BuiltInCategory.OST_PipeTags)
+            .WhereElementIsNotElementType()
+            .GetElementCount()
+        )
     except Exception:
-        pass
+        return -1
 
-    def _duplicate_with_detailing():
-        new_id = source_view.Duplicate(ViewDuplicateOption.WithDetailing)
-        new_view = doc.GetElement(new_id)
+
+def get_existing_pipe_tagged_host_ids_in_view(doc, view):
+    host_ids = set()
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for tag in tags:
+        try:
+            if hasattr(tag, "GetTaggedElementIds"):
+                ids = tag.GetTaggedElementIds()
+                for rid in ids:
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid:
+                        host_ids.add(hid.IntegerValue)
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                host_ids.add(tag.TaggedElementId.IntegerValue)
+        except Exception:
+            continue
+    return host_ids
+
+
+def get_pipe_tags_for_hosts_in_view(doc, view, host_id_set):
+    result = []
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for tag in tags:
+        try:
+            tagged_match = False
+            if hasattr(tag, "GetTaggedElementIds"):
+                ids = tag.GetTaggedElementIds()
+                for rid in ids:
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid and hid.IntegerValue in host_id_set:
+                        tagged_match = True
+                        break
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                if tag.TaggedElementId.IntegerValue in host_id_set:
+                    tagged_match = True
+            if tagged_match:
+                result.append(tag)
+        except Exception:
+            continue
+    return result
+
+
+def get_pipe_tag_ids_for_hosts_in_view(doc, view, host_id_set):
+    ids = []
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for tag in tags:
+        try:
+            matched = False
+            if hasattr(tag, "GetTaggedElementIds"):
+                for rid in tag.GetTaggedElementIds():
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid and hid.IntegerValue in host_id_set:
+                        matched = True
+                        break
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                if tag.TaggedElementId.IntegerValue in host_id_set:
+                    matched = True
+            if matched:
+                ids.append(tag.Id.IntegerValue)
+        except Exception:
+            continue
+    return ids
+
+
+def get_pipe_tag_for_host_in_view(doc, view, host_id):
+    tags = (
+        FilteredElementCollector(doc, view.Id)
+        .OfCategory(BuiltInCategory.OST_PipeTags)
+        .WhereElementIsNotElementType()
+        .ToElements()
+    )
+    for tag in tags:
+        try:
+            if hasattr(tag, "GetTaggedElementIds"):
+                for rid in tag.GetTaggedElementIds():
+                    hid = rid.HostElementId if hasattr(rid, "HostElementId") else rid
+                    if hid and hid.IntegerValue == host_id.IntegerValue:
+                        return tag
+            elif hasattr(tag, "TaggedElementId") and tag.TaggedElementId:
+                if tag.TaggedElementId.IntegerValue == host_id.IntegerValue:
+                    return tag
+        except Exception:
+            continue
+    return None
+
+
+def create_sheet_safe_plan_from_scanned_view(doc, source_view, desired_name):
+    last_error = None
+    with Transaction(doc, "Create sheet-safe plan clone") as t:
+        t.Start()
+        new_view = None
+        for opt in [ViewDuplicateOption.WithDetailing, ViewDuplicateOption.Duplicate]:
+            try:
+                new_id = source_view.Duplicate(opt)
+                new_view = doc.GetElement(new_id)
+                break
+            except Exception as ex:
+                last_error = ex
+                new_view = None
+        if new_view is None:
+            t.RollBack()
+            raise Exception(
+                "Failed to clone scanned source view for sheet: {}".format(last_error)
+            )
+
+        try:
+            new_view.ViewTemplateId = ElementId.InvalidElementId
+        except Exception:
+            pass
+        try:
+            new_view.Scale = source_view.Scale
+        except Exception:
+            pass
+        try:
+            new_view.CropBoxActive = source_view.CropBoxActive
+            new_view.CropBoxVisible = source_view.CropBoxVisible
+            new_view.CropBox = source_view.CropBox
+        except Exception:
+            pass
         if desired_name:
             try:
                 new_view.Name = desired_name
@@ -1549,49 +1684,199 @@ def get_view_id_for_sheet(doc, source_view, desired_name=None):
                     )
                 except Exception:
                     pass
-        return new_id
-
-    try:
-        if doc.IsModifiable:
-            return _duplicate_with_detailing(), "DuplicatedWithDetailing"
-        with Transaction(doc, "Create sheet-placeable duplicate view") as t:
-            t.Start()
-            nid = _duplicate_with_detailing()
-            t.Commit()
-        return nid, "DuplicatedWithDetailing"
-    except Exception as ex:
-        return None, "DuplicateFailed: {}".format(ex)
+        t.Commit()
+    return new_view
 
 
-def apply_tags_and_text_in_active_view(view, gathered_elements, result, polygon):
-    pipes_by_id = {}
+def apply_prefab_changes_to_view(doc, uidoc, target_view, result, polygon, gathered_elements):
+    """
+    Must:
+    - place/update prefab text note in target_view
+    - add/remove pipe tags in target_view
+    - not create sheet
+    - not duplicate any view
+    - commit changes in a real transaction
+    - return counts/debug info
+    """
+    print("APPLY PREFAB -> transaction start")
+    print(
+        "APPLY PREFAB -> target view:",
+        target_view.Name,
+        target_view.Id.IntegerValue,
+    )
+    scanned_pipes = []
+    scanned_pipe_ids = set()
     for e in gathered_elements:
         if (
             e
             and e.Category
             and e.Category.Id.IntegerValue == int(BuiltInCategory.OST_PipeCurves)
         ):
-            pipes_by_id[e.Id.IntegerValue] = e
+            scanned_pipes.append(e)
+            scanned_pipe_ids.add(e.Id.IntegerValue)
 
-    to_add = []
-    to_remove = []
-    for e_data in result.get("Elements", []):
-        if e_data.get("Category") != "Pipes":
-            continue
-        eid = safe_int(e_data.get("Id"), 0)
-        if eid <= 0 or eid not in pipes_by_id:
-            continue
-        status = (e_data.get("TagStatus") or "").strip()
-        if status == "Remove Tag":
-            to_add.append(pipes_by_id[eid])
-        elif status == "Add/Place Tag":
-            to_remove.append(pipes_by_id[eid])
+    existing_tagged_host_ids = get_existing_pipe_tagged_host_ids_in_view(doc, target_view)
+    existing_on_scanned = scanned_pipe_ids.intersection(existing_tagged_host_ids)
+    print("APPLY PREFAB -> scanned pipes:", len(scanned_pipe_ids))
+    print("APPLY PREFAB -> existing tags on scanned pipes:", len(existing_on_scanned))
+    resolved, missing_types = resolve_required_tag_symbols(doc)
+    sym_aco = resolved.get("ACO_PIPE")
+    sym_vert = resolved.get("VERT_ARROW")
 
-    if to_remove:
-        tag_pipes_in_view(view, to_remove, action="remove_all", source_view=view)
-    missing_types, failures = tag_pipes_in_view(
-        view, to_add, action="add_missing", source_view=view
-    )
+    created_count = 0
+    kept_count = 0
+    remove_count = 0
+    failures = []
+    text_note_done = False
+    original_template_id = None
+    template_detached = False
+    t = Transaction(doc, "Apply prefab tags/text")
+    try:
+        t.Start()
+
+        try:
+            original_template_id = target_view.ViewTemplateId
+        except Exception:
+            original_template_id = ElementId.InvalidElementId
+        print(
+            "APPLY ONLY -> original template id:",
+            original_template_id.IntegerValue if original_template_id else -1,
+        )
+        try:
+            if original_template_id and original_template_id != ElementId.InvalidElementId:
+                target_view.ViewTemplateId = ElementId.InvalidElementId
+                template_detached = True
+                print("APPLY ONLY -> template detached for tagging")
+        except Exception:
+            pass
+
+        raw_text = (result.get("TextNote", "") or "").strip()
+        if raw_text:
+            pminx, pminy, _, _ = polygon_bounds_xy(polygon)
+            note_pt = XYZ(pminx + XY_PAD, pminy + XY_PAD, 0)
+            prefab_re = re.compile(r"\d+(?:\.\d+)+")
+            notes = (
+                FilteredElementCollector(doc, target_view.Id)
+                .OfClass(TextNote)
+                .WhereElementIsNotElementType()
+                .ToElements()
+            )
+            target_note = None
+            for n in notes:
+                try:
+                    txt = n.Text or ""
+                    p = n.Coord
+                    if prefab_re.search(txt) and is_point_inside_polygon(
+                        XYZ(p.X, p.Y, 0), polygon
+                    ):
+                        target_note = n
+                        break
+                except Exception:
+                    continue
+            if target_note:
+                target_note.Text = raw_text
+                text_note_done = True
+            else:
+                nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+                if nt:
+                    TextNote.Create(
+                        doc, target_view.Id, note_pt, raw_text, TextNoteOptions(nt.Id)
+                    )
+                    text_note_done = True
+
+        desired_tag_host_ids = set()
+        explicit_remove_host_ids = set()
+        for e_data in result.get("Elements", []):
+            if e_data.get("Category") != "Pipes":
+                continue
+            eid = safe_int(e_data.get("Id"), 0)
+            if eid <= 0 or eid not in scanned_pipe_ids:
+                continue
+            status = (e_data.get("TagStatus") or "").strip()
+            if status == "Remove Tag":
+                desired_tag_host_ids.add(eid)
+            elif status == "Add/Place Tag":
+                explicit_remove_host_ids.add(eid)
+
+        for host_id in explicit_remove_host_ids:
+            existing_tag = get_pipe_tag_for_host_in_view(doc, target_view, ElementId(host_id))
+            if existing_tag is not None:
+                try:
+                    doc.Delete(existing_tag.Id)
+                    remove_count += 1
+                except Exception:
+                    pass
+
+        for p in scanned_pipes:
+            if p.Id.IntegerValue not in desired_tag_host_ids:
+                continue
+            existing_tag = get_pipe_tag_for_host_in_view(doc, target_view, p.Id)
+            if existing_tag is not None:
+                kept_count += 1
+                continue
+            is_vert = is_vertical_pipe(p)
+            if is_vert:
+                sym = sym_vert
+                use_leader = bool(TAGCFG_VERD.get("leader", False))
+                use_offset_mm = TAGCFG_VERD.get("offset_mm", 0)
+            else:
+                sym = sym_aco
+                use_leader = bool(TAGCFG_ACO.get("leader", True))
+                use_offset_mm = TAGCFG_ACO.get("offset_mm", 400)
+            if sym is None:
+                failures.append(p.Id.IntegerValue)
+                continue
+            try:
+                pt = _midpoint_or_center(p, target_view)
+                tag = IndependentTag.Create(
+                    doc,
+                    target_view.Id,
+                    Reference(p),
+                    use_leader,
+                    TagMode.TM_ADDBY_CATEGORY,
+                    TagOrientation.Horizontal,
+                    pt,
+                )
+                tag.ChangeTypeId(sym.Id)
+                if use_leader:
+                    try:
+                        tag.HasLeader = True
+                    except Exception:
+                        pass
+                if use_offset_mm and use_offset_mm > 0:
+                    off = view_offset_vector(target_view, use_offset_mm)
+                    try:
+                        tag.TagHeadPosition = XYZ(
+                            pt.X + off.X, pt.Y + off.Y, pt.Z + off.Z
+                        )
+                    except Exception:
+                        pass
+                created_count += 1
+            except Exception:
+                failures.append(p.Id.IntegerValue)
+
+        doc.Regenerate()
+        print(
+            "APPLY PREFAB -> counts before commit: add={}, remove={}".format(
+                created_count, remove_count
+            )
+        )
+        t.Commit()
+        print("APPLY PREFAB -> transaction committed")
+    except Exception:
+        try:
+            if t.HasStarted():
+                t.RollBack()
+        except Exception:
+            pass
+        raise
+
+    post_count = count_pipe_tags_in_view(doc, target_view)
+    print("APPLY PREFAB -> pipe tags visible in target view after commit:", post_count)
+    print("APPLY PREFAB -> tags recreated:", created_count)
+    if template_detached:
+        print("APPLY ONLY -> template left detached after apply-only")
+
     if missing_types:
         TaskDialog.Show(
             "Missing Pipe Tag Types",
@@ -1607,211 +1892,305 @@ def apply_tags_and_text_in_active_view(view, gathered_elements, result, polygon)
             ),
         )
 
-    ensure_prefab_text_note_in_view(
-        view, polygon, (result.get("TextNote", "") or "").strip()
+    return {
+        "target_view_name": target_view.Name,
+        "target_view_id": target_view.Id.IntegerValue,
+        "kept_tags": kept_count,
+        "added_tags": created_count,
+        "removed_tags": remove_count,
+        "text_note_placed": text_note_done,
+        "template_detached": template_detached,
+        "scanned_pipe_ids": sorted(list(scanned_pipe_ids)),
+    }
+
+
+def main():
+    scanned_source_view = uidoc.ActiveView
+    scanned_source_view_id = scanned_source_view.Id
+    print(
+        "SCANNED SOURCE VIEW:",
+        scanned_source_view.Name,
+        scanned_source_view_id.IntegerValue,
     )
+    gathered_elements, polygon = select_boundary_and_gather()
+    if not gathered_elements:
+        MessageBox.Show("No elements were gathered. Cancelled.", "Error")
+        return
 
+    filtered = filter_relevant_elements(gathered_elements)
+    if not filtered:
+        MessageBox.Show("No relevant elements found in region.", "Error")
+        return
 
-# ==================================================
-# MAIN
-# ==================================================
-gathered_elements, polygon = select_boundary_and_gather()
-if not gathered_elements:
-    MessageBox.Show("No elements were gathered. Cancelled.", "Error")
-    sys.exit("Cancelled")
+    result = show_element_editor(
+        filtered, region_elements=gathered_elements, region_polygon=polygon
+    )
+    if result is None:
+        return
 
-filtered = filter_relevant_elements(gathered_elements)
-if not filtered:
-    MessageBox.Show("No relevant elements found in region.", "Error")
-    sys.exit("Cancelled")
+    workflow_choice = choose_post_editor_workflow()
+    if workflow_choice == "cancel":
+        return
 
-result = show_element_editor(
-    filtered, region_elements=gathered_elements, region_polygon=polygon
-)
-if result is None:
-    sys.exit("Cancelled")
+    uidoc.Selection.SetElementIds(List[ElementId]())
 
-workflow_choice = choose_post_editor_workflow()
-if workflow_choice == "cancel":
-    sys.exit("Cancelled")
-
-uidoc.Selection.SetElementIds(List[ElementId]())
-
-# Force fittings to base
-baseCode = result["TextNote"]
-for eData in result["Elements"]:
-    if eData["Category"] == "Pipe Fittings":
-        eData["NewCode"] = baseCode
-
-# Renumber pipes if no placed text note
-if not result.get("TextNotePlaced", False):
-    base_raw = (result.get("TextNote", "") or "").strip()
-    m = re.search(r"([\d\.]+)", base_raw)
-    base = m.group(1) if m else "0"
-    pipe_entries = []
-    for idx, eData in enumerate(result["Elements"]):
-        if eData["Category"] == "Pipes":
-            elem = doc.GetElement(ElementId(int(str(eData["Id"]))))
-            if elem:
-                bb = elem.get_BoundingBox(uidoc.ActiveView)
-                if bb:
-                    center = XYZ(
-                        (bb.Min.X + bb.Max.X) / 2.0,
-                        (bb.Min.Y + bb.Max.Y) / 2.0,
-                        (bb.Min.Z + bb.Max.Z) / 2.0,
-                    )
-                    pipe_entries.append((idx, center))
-    pipe_entries.sort(key=lambda x: (x[1].X, x[1].Y))
-    ctr = 1
-    for i, _ in pipe_entries:
-        result["Elements"][i]["NewCode"] = base + "." + str(ctr)
-        ctr += 1
+    baseCode = result["TextNote"]
     for eData in result["Elements"]:
         if eData["Category"] == "Pipe Fittings":
-            eData["NewCode"] = base
+            eData["NewCode"] = baseCode
 
-source_view = uidoc.ActiveView
-if not isinstance(source_view, ViewPlan):
-    MessageBox.Show("Active view is not a plan/callout view.", "Error")
-    sys.exit()
-
-# -------- Phase 1: apply tags + text note (always committed) --------
-resolved_syms, missing_req = resolve_required_tag_symbols(doc)
-if missing_req:
-    TaskDialog.Show(
-        "Missing Pipe Tag Types",
-        "Could not find required tag types:\n- " + "\n- ".join(missing_req),
-    )
-
-apply_tags_and_text_in_active_view(source_view, gathered_elements, result, polygon)
-
-# Update Comments (optional in safe-mode)
-if SAFE_CFG.get("write_comments_codes", False):
-    with Transaction(doc, "Update Comments (safe)") as t:
-        t.Start()
-        for eData in result["Elements"]:
-            id_val = eData.get("Id")
-            try:
-                eid = int(str(id_val))
-            except:
-                continue
-            elem = doc.GetElement(ElementId(eid))
-            if not elem:
-                continue
-            p = elem.LookupParameter("Comments")
-            if not p or p.IsReadOnly:
-                continue
+    if not result.get("TextNotePlaced", False):
+        base_raw = (result.get("TextNote", "") or "").strip()
+        m = re.search(r"([\d\.]+)", base_raw)
+        base = m.group(1) if m else "0"
+        pipe_entries = []
+        for idx, eData in enumerate(result["Elements"]):
             if eData["Category"] == "Pipes":
-                continue
+                elem = doc.GetElement(ElementId(int(str(eData["Id"]))))
+                if elem:
+                    bb = elem.get_BoundingBox(uidoc.ActiveView)
+                    if bb:
+                        center = XYZ(
+                            (bb.Min.X + bb.Max.X) / 2.0,
+                            (bb.Min.Y + bb.Max.Y) / 2.0,
+                            (bb.Min.Z + bb.Max.Z) / 2.0,
+                        )
+                        pipe_entries.append((idx, center))
+        pipe_entries.sort(key=lambda x: (x[1].X, x[1].Y))
+        ctr = 1
+        for i, _ in pipe_entries:
+            result["Elements"][i]["NewCode"] = base + "." + str(ctr)
+            ctr += 1
+        for eData in result["Elements"]:
             if eData["Category"] == "Pipe Fittings":
-                p.Set(result["TextNote"])
-            else:
-                p.Set(str(eData["NewCode"]))
-        t.Commit()
+                eData["NewCode"] = base
 
-if workflow_choice == "apply_only":
-    TaskDialog.Show("Bunge Sheet Gen", "Tags/text placed. Sheet skipped.")
-    sys.exit()
+    source_view = scanned_source_view
+    if not isinstance(source_view, ViewPlan):
+        MessageBox.Show("Active view is not a plan/callout view.", "Error")
+        return
 
-# -------- Phase 2: create sheet (isolated; failures do not rollback phase 1) --------
-m = re.search(r"([\d\.]+)", result["TextNote"])
-base = m.group(1) if m else (result["TextNote"] or "").strip()
-
-# -------- Title-block picker & sheet creation (simple) --------
-# collect title-blocks
-all_tbs = list(
-    FilteredElementCollector(doc)
-    .OfCategory(BuiltInCategory.OST_TitleBlocks)
-    .OfClass(FamilySymbol)
-    .ToElements()
-)
-
-if not all_tbs:
-    MessageBox.Show("No title-block types found.", "Error")
-    sys.exit()
-
-
-class TBPicker(Form):
-    def __init__(self, tbs):
-        self.tbs = tbs
-        self.Text = "Choose a Title-Block"
-        self.ClientSize = Size(340, 360)
-        self.lb = ListBox()
-        self.lb.Bounds = Rectangle(10, 10, 320, 300)
-        for sym in tbs:
-            fam = sym.Family.Name if sym.Family else ""
-            type_name = (
-                sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM).AsString() or ""
-            )
-            self.lb.Items.Add(fam + " - " + type_name)
-        self.Controls.Add(self.lb)
-        ok = Button(Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 320))
-        ca = Button(
-            Text="Cancel", DialogResult=DialogResult.Cancel, Location=Point(100, 320)
+    resolved_syms, missing_req = resolve_required_tag_symbols(doc)
+    if missing_req:
+        TaskDialog.Show(
+            "Missing Pipe Tag Types",
+            "Could not find required tag types:\n- " + "\n- ".join(missing_req),
         )
-        self.Controls.Add(ok)
-        self.Controls.Add(ca)
-        self.AcceptButton = ok
-        self.CancelButton = ca
 
+    apply_info = apply_prefab_changes_to_view(
+        doc, uidoc, source_view, result, polygon, gathered_elements
+    )
 
-existing_sheets = FilteredElementCollector(doc).OfClass(ViewSheet).ToElements()
-existing_numbers = {s.SheetNumber for s in existing_sheets}
+    if SAFE_CFG.get("write_comments_codes", False):
+        with Transaction(doc, "Update Comments (safe)") as t:
+            t.Start()
+            for eData in result["Elements"]:
+                id_val = eData.get("Id")
+                try:
+                    eid = int(str(id_val))
+                except:
+                    continue
+                elem = doc.GetElement(ElementId(eid))
+                if not elem:
+                    continue
+                p = elem.LookupParameter("Comments")
+                if not p or p.IsReadOnly:
+                    continue
+                if eData["Category"] == "Pipes":
+                    continue
+                if eData["Category"] == "Pipe Fittings":
+                    p.Set(result["TextNote"])
+                else:
+                    p.Set(str(eData["NewCode"]))
+            t.Commit()
 
-picker = TBPicker(all_tbs)
-if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
-    MessageBox.Show("Sheet creation cancelled. Tags/text are kept.", "Info")
-    sys.exit()
+    if workflow_choice == "apply_only":
+        target_view = source_view
+        try:
+            if uidoc.ActiveView.Id != target_view.Id:
+                uidoc.ActiveView = target_view
+        except Exception as ex:
+            print("APPLY ONLY -> failed to activate target view:", ex)
 
-title_block = all_tbs[picker.lb.SelectedIndex]
-sheet_code = base
-if sheet_code in existing_numbers:
-    sheet_code = "{} ({})".format(base, source_view.Id.IntegerValue)
-
-# Ensure TB active
-try:
-    if hasattr(title_block, "IsActive") and (not title_block.IsActive):
-        with Transaction(doc, "Activate title block") as t_act:
-            t_act.Start()
-            title_block.Activate()
-            t_act.Commit()
-except:
-    pass
-
-try:
-    with Transaction(doc, "Create sheet & place plan (safe)") as t3:
-        t3.Start()
-        sheet = ViewSheet.Create(doc, title_block.Id)
-        sheet.SheetNumber = sheet_code
-        sheet.Name = "Prefab " + sheet_code
-
-        # center-ish placement
-        view_id_to_place = source_view.Id
-        if not Viewport.CanAddViewToSheet(doc, sheet.Id, view_id_to_place):
-            dup_name = "{} - Sheet".format(sheet_code)
-            view_id_to_place, _why = get_view_id_for_sheet(
-                doc, source_view, desired_name=dup_name
+        scanned_pipe_ids = set(apply_info.get("scanned_pipe_ids", []))
+        final_tag_ids = get_pipe_tag_ids_for_hosts_in_view(doc, target_view, scanned_pipe_ids)
+        print("APPLY ONLY -> before success dialog")
+        try:
+            print(
+                "APPLY ONLY -> active view now:",
+                uidoc.ActiveView.Name,
+                uidoc.ActiveView.Id.IntegerValue,
             )
-        if (
-            not view_id_to_place
-            or not Viewport.CanAddViewToSheet(doc, sheet.Id, view_id_to_place)
-        ):
-            raise Exception("Could not place view on sheet (even after duplication).")
-        center = XYZ(
-            (sheet.Outline.Min.U + sheet.Outline.Max.U) / 2.0,
-            (sheet.Outline.Min.V + sheet.Outline.Max.V) / 2.0,
-            0,
+        except Exception as ex:
+            print("APPLY ONLY -> active view read failed:", ex)
+        print(
+            "APPLY ONLY -> target view now:",
+            target_view.Name,
+            target_view.Id.IntegerValue,
         )
-        Viewport.Create(doc, sheet.Id, view_id_to_place, center)
+        print("APPLY ONLY -> tag ids before popup:", final_tag_ids)
+        print("APPLY ONLY -> final tag count:", len(final_tag_ids))
+        try:
+            print(
+                "APPLY ONLY -> target view template id:",
+                target_view.ViewTemplateId.IntegerValue,
+            )
+            print("APPLY ONLY -> target view is template:", target_view.IsTemplate)
+        except Exception as ex:
+            print("APPLY ONLY -> template info read failed:", ex)
+        pipe_tag_cat = Category.GetCategory(doc, BuiltInCategory.OST_PipeTags)
+        if pipe_tag_cat:
+            try:
+                print(
+                    "APPLY ONLY -> pipe tag category hidden:",
+                    target_view.GetCategoryHidden(pipe_tag_cat.Id),
+                )
+            except Exception as ex:
+                print("APPLY ONLY -> failed hidden check:", ex)
 
-        # schedules & 3D intentionally skipped in safe-mode
-        t3.Commit()
-    MessageBox.Show(
-        "Prefab sheet '{}' created and plan placed.".format(sheet.SheetNumber), "Done"
+        TaskDialog.Show(
+            "Bunge Sheet Gen",
+            "Prefab text and tags were applied to the current scanned view:\n{}\n\nKept tags: {}\nAdded tags: {}\nRemoved tags: {}\nText note placed: {}\nTemplate detached: {}".format(
+                target_view.Name,
+                apply_info.get("kept_tags", 0),
+                apply_info.get("added_tags", 0),
+                apply_info.get("removed_tags", 0),
+                apply_info.get("text_note_placed", False),
+                apply_info.get("template_detached", False),
+            ),
+        )
+        post_popup_tag_ids = get_pipe_tag_ids_for_hosts_in_view(
+            doc, target_view, scanned_pipe_ids
+        )
+        print("APPLY ONLY -> success dialog closed")
+        print("APPLY ONLY -> tag ids after popup returns:", post_popup_tag_ids)
+        print("APPLY ONLY -> tag count after popup returns:", len(post_popup_tag_ids))
+        try:
+            print(
+                "APPLY ONLY -> final template id before return:",
+                target_view.ViewTemplateId.IntegerValue,
+            )
+        except Exception as ex:
+            print("APPLY ONLY -> final template id read failed:", ex)
+        if post_popup_tag_ids:
+            try:
+                uidoc.ActiveView = target_view
+            except Exception as ex:
+                print("APPLY ONLY -> failed to reactivate target view:", ex)
+            try:
+                uidoc.RefreshActiveView()
+            except Exception as ex:
+                print("APPLY ONLY -> refresh active view failed:", ex)
+        print("APPLY ONLY -> returning cleanly from main")
+        return
+
+    m = re.search(r"([\d\.]+)", result["TextNote"])
+    base = m.group(1) if m else (result["TextNote"] or "").strip()
+
+    all_tbs = list(
+        FilteredElementCollector(doc)
+        .OfCategory(BuiltInCategory.OST_TitleBlocks)
+        .OfClass(FamilySymbol)
+        .ToElements()
     )
-except Exception as ex:
-    TaskDialog.Show(
-        "Bunge Sheet Gen",
-        "Sheet creation failed, but tags/text are kept.\n\n{}".format(ex),
-    )
+    if not all_tbs:
+        MessageBox.Show("No title-block types found.", "Error")
+        return
+
+    class TBPicker(Form):
+        def __init__(self, tbs):
+            self.tbs = tbs
+            self.Text = "Choose a Title-Block"
+            self.ClientSize = Size(340, 360)
+            self.lb = ListBox()
+            self.lb.Bounds = Rectangle(10, 10, 320, 300)
+            for sym in tbs:
+                fam = sym.Family.Name if sym.Family else ""
+                type_name = (
+                    sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM).AsString() or ""
+                )
+                self.lb.Items.Add(fam + " - " + type_name)
+            self.Controls.Add(self.lb)
+            ok = Button(Text="OK", DialogResult=DialogResult.OK, Location=Point(10, 320))
+            ca = Button(
+                Text="Cancel", DialogResult=DialogResult.Cancel, Location=Point(100, 320)
+            )
+            self.Controls.Add(ok)
+            self.Controls.Add(ca)
+            self.AcceptButton = ok
+            self.CancelButton = ca
+
+    existing_sheets = FilteredElementCollector(doc).OfClass(ViewSheet).ToElements()
+    existing_numbers = {s.SheetNumber for s in existing_sheets}
+
+    picker = TBPicker(all_tbs)
+    if picker.ShowDialog() != DialogResult.OK or picker.lb.SelectedIndex < 0:
+        MessageBox.Show("Sheet creation cancelled. Tags/text are kept.", "Info")
+        return
+
+    title_block = all_tbs[picker.lb.SelectedIndex]
+    sheet_code = base
+    if sheet_code in existing_numbers:
+        sheet_code = "{} ({})".format(base, source_view.Id.IntegerValue)
+
+    try:
+        if hasattr(title_block, "IsActive") and (not title_block.IsActive):
+            with Transaction(doc, "Activate title block") as t_act:
+                t_act.Start()
+                title_block.Activate()
+                t_act.Commit()
+    except:
+        pass
+
+    try:
+        target_view = source_view
+        print("SHEET MODE -> using existing scanned source view:", target_view.Name, target_view.Id.IntegerValue)
+        print("SHEET MODE -> source view type:", target_view.ViewType)
+        print("SHEET MODE -> source view template id:", target_view.ViewTemplateId.IntegerValue)
+        try:
+            print("SHEET MODE -> primary view id:", target_view.GetPrimaryViewId().IntegerValue)
+        except Exception:
+            print("SHEET MODE -> primary view id: n/a")
+
+        clone_name = "{} - Sheet".format(sheet_code)
+        sheet_view = create_sheet_safe_plan_from_scanned_view(doc, target_view, clone_name)
+
+        with Transaction(doc, "Create sheet & place plan (safe)") as t3:
+            t3.Start()
+            sheet = ViewSheet.Create(doc, title_block.Id)
+            sheet.SheetNumber = sheet_code
+            sheet.Name = "Prefab " + sheet_code
+
+            view_id_to_place = sheet_view.Id
+            can_add = Viewport.CanAddViewToSheet(doc, sheet.Id, sheet_view.Id)
+            print("SHEET MODE -> trying CanAddViewToSheet for:", sheet_view.Name, sheet_view.Id.IntegerValue)
+            print("SHEET MODE -> can add:", can_add)
+            if not can_add:
+                raise Exception(
+                    "Sheet-safe cloned view cannot be placed on sheet: {}".format(
+                        "{} (id={})".format(sheet_view.Name, sheet_view.Id.IntegerValue)
+                    )
+                )
+            print("SHEET MODE -> placing sheet-safe cloned view on sheet:", sheet_view.Name, sheet_view.Id.IntegerValue)
+            center = XYZ(
+                (sheet.Outline.Min.U + sheet.Outline.Max.U) / 2.0,
+                (sheet.Outline.Min.V + sheet.Outline.Max.V) / 2.0,
+                0,
+            )
+            Viewport.Create(doc, sheet.Id, view_id_to_place, center)
+            t3.Commit()
+        MessageBox.Show(
+            "Prefab text and tags were applied to the current scanned view and a sheet-safe clone was placed on the sheet.\nSource view: {}\nSheet view: {}\n\nSheet: {}".format(
+                target_view.Name, sheet_view.Name, sheet.SheetNumber
+            ),
+            "Done",
+        )
+    except Exception as ex:
+        TaskDialog.Show(
+            "Bunge Sheet Gen",
+            "Sheet creation failed, but tags/text are kept.\n\n{}".format(ex),
+        )
+
+
+main()
 
