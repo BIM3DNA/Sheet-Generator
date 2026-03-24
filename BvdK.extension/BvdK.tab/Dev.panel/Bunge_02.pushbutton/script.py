@@ -836,13 +836,31 @@ def find_extra_horizontal_targets(scanned_pipes):
     for vp in verticals:
         connected_ids = get_connected_pipe_ids(vp, scanned_pipe_id_set)
         horiz = []
+        vp_connectors = get_pipe_connectors(vp)
         for cid in connected_ids:
             cp = by_id.get(cid)
-            if cp and is_horizontal_pipe(cp):
-                horiz.append(cp)
-        horiz = sorted(horiz, key=lambda p: p.Id.IntegerValue)
+            if not cp or not is_horizontal_pipe(cp) or is_excluded_nlrs_pipe(cp):
+                continue
+            best_dist = 1e18
+            try:
+                cp_connectors = get_pipe_connectors(cp)
+                for vc in vp_connectors:
+                    for cc in cp_connectors:
+                        try:
+                            d = vc.Origin.DistanceTo(cc.Origin)
+                        except Exception:
+                            dx = vc.Origin.X - cc.Origin.X
+                            dy = vc.Origin.Y - cc.Origin.Y
+                            dz = vc.Origin.Z - cc.Origin.Z
+                            d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                        if d < best_dist:
+                            best_dist = d
+            except Exception:
+                best_dist = 1e18
+            horiz.append((best_dist, cp.Id.IntegerValue, cp))
+        horiz = sorted(horiz, key=lambda x: (x[0], x[1]))
         if horiz:
-            targets.add(horiz[0].Id.IntegerValue)
+            targets.add(horiz[0][2].Id.IntegerValue)
     return targets, verticals
 
 
@@ -1672,6 +1690,54 @@ def view_offset_vector(view, mm):
         return XYZ(d, d * 0.25, 0)
 
 
+def choose_plan_tag_head(elem, view, anchor_pt, base_mm, occupied_pts):
+    try:
+        dir_xy = get_curve_direction_xy(elem)
+        side = get_short_side_vector_xy(dir_xy)
+    except Exception:
+        side = XYZ(1, 0, 0)
+    try:
+        up = view.UpDirection
+    except Exception:
+        up = XYZ(0, 1, 0)
+    side_ft = mm_to_ft(base_mm)
+    up_ft = mm_to_ft(max(90.0, base_mm * 0.30))
+    candidates = [
+        XYZ(
+            anchor_pt.X + side.X * side_ft + up.X * up_ft,
+            anchor_pt.Y + side.Y * side_ft + up.Y * up_ft,
+            anchor_pt.Z + side.Z * side_ft + up.Z * up_ft,
+        ),
+        XYZ(
+            anchor_pt.X - side.X * side_ft + up.X * up_ft,
+            anchor_pt.Y - side.Y * side_ft + up.Y * up_ft,
+            anchor_pt.Z - side.Z * side_ft + up.Z * up_ft,
+        ),
+        XYZ(
+            anchor_pt.X + side.X * side_ft * 1.35 + up.X * up_ft * 1.4,
+            anchor_pt.Y + side.Y * side_ft * 1.35 + up.Y * up_ft * 1.4,
+            anchor_pt.Z + side.Z * side_ft * 1.35 + up.Z * up_ft * 1.4,
+        ),
+        XYZ(
+            anchor_pt.X - side.X * side_ft * 1.35 + up.X * up_ft * 1.4,
+            anchor_pt.Y - side.Y * side_ft * 1.35 + up.Y * up_ft * 1.4,
+            anchor_pt.Z - side.Z * side_ft * 1.35 + up.Z * up_ft * 1.4,
+        ),
+    ]
+    min_clear = mm_to_ft(120.0)
+    for cand in candidates:
+        conflict = False
+        for pt in occupied_pts:
+            dx = cand.X - pt.X
+            dy = cand.Y - pt.Y
+            if math.sqrt(dx * dx + dy * dy) < min_clear:
+                conflict = True
+                break
+        if not conflict:
+            return cand
+    return candidates[0]
+
+
 def tag_pipes_in_view(view, pipes, action="add_missing", source_view=None):
     """
     action:
@@ -1686,6 +1752,9 @@ def tag_pipes_in_view(view, pipes, action="add_missing", source_view=None):
     sym_vert = resolved.get("VERT_ARROW")
     missing_types = set()
     failures = []
+    occupied_nonvert_heads = []
+    nonvertical_adjusted = 0
+    vertical_preserved = 0
     with Transaction(doc, "Tag pipes in view") as t:
         t.Start()
         for p in pipes:
@@ -1753,18 +1822,24 @@ def tag_pipes_in_view(view, pipes, action="add_missing", source_view=None):
                         tag.HasLeader = True
                     except Exception:
                         pass
-                if use_offset_mm and use_offset_mm > 0:
-                    off = view_offset_vector(view, use_offset_mm)
+                if is_vert:
+                    vertical_preserved += 1
+                elif use_offset_mm and use_offset_mm > 0:
+                    head_pt = choose_plan_tag_head(
+                        p, view, pt, max(300, use_offset_mm), occupied_nonvert_heads
+                    )
                     try:
-                        tag.TagHeadPosition = XYZ(
-                            pt.X + off.X, pt.Y + off.Y, pt.Z + off.Z
-                        )
+                        tag.TagHeadPosition = head_pt
+                        occupied_nonvert_heads.append(head_pt)
+                        nonvertical_adjusted += 1
                     except Exception:
                         pass
             except Exception:
                 failures.append(p.Id.IntegerValue)
         doc.Regenerate()
         t.Commit()
+    print("FLOOR PLAN -> nonvertical tags adjusted:", nonvertical_adjusted)
+    print("FLOOR PLAN -> vertical tags preserved:", vertical_preserved)
     return missing_types, failures
 
 
@@ -2969,6 +3044,95 @@ def get_close_3d_tag_points(view3d, elem, is_vertical=False, is_extra=False):
 
 
 def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
+    def rects_overlap(a, b):
+        return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+    def bbox_rect(bb):
+        return (bb.Min.X, bb.Min.Y, bb.Max.X, bb.Max.Y)
+
+    def expand_rect(rect, mm):
+        pad = mm_to_ft(mm)
+        return (rect[0] - pad, rect[1] - pad, rect[2] + pad, rect[3] + pad)
+
+    def text_rect(pt):
+        return (
+            pt.X - mm_to_ft(80.0),
+            pt.Y - mm_to_ft(40.0),
+            pt.X + mm_to_ft(80.0),
+            pt.Y + mm_to_ft(40.0),
+        )
+
+    def fitting_groups_from_fittings(fits):
+        data = []
+        for fit in fits:
+            try:
+                bb = fit.get_BoundingBox(view3d)
+                if not bb:
+                    continue
+                ctr = XYZ(
+                    (bb.Min.X + bb.Max.X) * 0.5,
+                    (bb.Min.Y + bb.Max.Y) * 0.5,
+                    (bb.Min.Z + bb.Max.Z) * 0.5,
+                )
+                data.append((fit, bb, ctr))
+            except Exception:
+                continue
+        groups = []
+        used = set()
+        tol = mm_to_ft(80.0)
+        for fit, bb, ctr in data:
+            fid = fit.Id.IntegerValue
+            if fid in used:
+                continue
+            group = [(fit, bb, ctr)]
+            used.add(fid)
+            changed = True
+            while changed:
+                changed = False
+                for ofit, obb, octr in data:
+                    oid = ofit.Id.IntegerValue
+                    if oid in used:
+                        continue
+                    for _, gbb, gctr in group:
+                        dx = gctr.X - octr.X
+                        dy = gctr.Y - octr.Y
+                        dz = gctr.Z - octr.Z
+                        near_ctr = math.sqrt(dx * dx + dy * dy + dz * dz) <= tol
+                        near_bb = not (
+                            gbb.Max.X + tol < obb.Min.X
+                            or gbb.Min.X - tol > obb.Max.X
+                            or gbb.Max.Y + tol < obb.Min.Y
+                            or gbb.Min.Y - tol > obb.Max.Y
+                            or gbb.Max.Z + tol < obb.Min.Z
+                            or gbb.Min.Z - tol > obb.Max.Z
+                        )
+                        if near_ctr or near_bb:
+                            group.append((ofit, obb, octr))
+                            used.add(oid)
+                            changed = True
+                            break
+            groups.append(group)
+        groups.sort(
+            key=lambda grp: (
+                sum(x[2].X for x in grp) / float(len(grp)),
+                sum(x[2].Y for x in grp) / float(len(grp)),
+                min(x[0].Id.IntegerValue for x in grp),
+            )
+        )
+        return groups
+
+    def nearest_dist(pt, pts):
+        if not pts:
+            return 1e9
+        return min(
+            math.sqrt(
+                (pt.X - p.X) * (pt.X - p.X)
+                + (pt.Y - p.Y) * (pt.Y - p.Y)
+                + (pt.Z - p.Z) * (pt.Z - p.Z)
+            )
+            for p in pts
+        )
+
     attempted_tag_count = 0
     successful_real_tag_count = 0
     failed_real_tag_count = 0
@@ -2977,20 +3141,19 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
     regular_tag_count = 0
     extra_tag_count = 0
     sample_head_distances = []
-    pipes = []
-    for e in scanned_elems:
-        if (
-            e
-            and e.Category
-            and e.Category.Id.IntegerValue == int(BuiltInCategory.OST_PipeCurves)
-        ):
-            if is_excluded_nlrs_pipe(e):
-                excluded_nlrs_pipe_count += 1
-                continue
-            pipes.append(e)
-    if not pipes:
+    text_count = 0
+    fitting_number_count = 0
+    displaced_vertical_tags = 0
+    occupied_pipe_label_rects = []
+    adjusted_pipe_tags = 0
+
+    relevant_elems, pipes, fittings, excluded_nlrs_pipe_count = get_prefab_3d_elements(
+        scanned_elems
+    )
+    if not pipes and not fittings:
         return {
             "tags": 0,
+            "text": 0,
             "mode": "none",
             "excluded_nlrs": excluded_nlrs_pipe_count,
             "attempted": 0,
@@ -3000,6 +3163,7 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
             "extra_real": 0,
             "sample_head_distances": [],
         }
+
     view_locked = False
     try:
         view_locked = bool(view3d.IsLocked) if hasattr(view3d, "IsLocked") else False
@@ -3012,19 +3176,7 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
         "locked:",
         view_locked,
     )
-    if not view_locked:
-        print("3D TAGGING SKIPPED -> view not locked:", view3d.Name)
-        return {
-            "tags": 0,
-            "mode": "skipped",
-            "excluded_nlrs": excluded_nlrs_pipe_count,
-            "attempted": 0,
-            "failed": 0,
-            "vertical_real": 0,
-            "regular_real": 0,
-            "extra_real": 0,
-            "sample_head_distances": [],
-        }
+
     resolved, _ = resolve_required_tag_symbols(doc)
     sym_regular = choose_best_symbol_for_family(
         doc, "RSen_GA_tag pipe_ACO", ["TypeMark + DN + ø"]
@@ -3032,48 +3184,46 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
     sym_vertical = resolved.get("VERT_ARROW")
     sym_extra = resolved.get("EXTRA_HORIZONTAL")
     extra_targets, _ = find_extra_horizontal_targets(pipes)
-    print("3D EXPLODED -> extra horizontal-connected targets:", len(extra_targets))
+    pipe_midpoints = [get_exploded_visible_anchor_pt(p, view3d) for p in pipes]
+    pipe_bbox_rects = []
+    for pipe in pipes:
+        try:
+            bb = pipe.get_BoundingBox(view3d)
+            if bb:
+                pipe_bbox_rects.append(expand_rect(bbox_rect(bb), 50.0))
+        except Exception:
+            pass
+
     with Transaction(doc, "Annotate Exploded 3D With Real Tags") as t:
         t.Start()
+        nt = FilteredElementCollector(doc).OfClass(TextNoteType).FirstElement()
+
         for pipe in pipes:
-            labels = []
             if is_vertical_pipe(pipe):
-                labels.append(("vertical", sym_vertical.Id if sym_vertical else None))
-                vertical_tag_count += 1
-            else:
-                labels.append(("regular", sym_regular.Id if sym_regular else None))
-                regular_tag_count += 1
-            if pipe.Id.IntegerValue in extra_targets:
-                labels.append(("extra", sym_extra.Id if sym_extra else None))
-                extra_tag_count += 1
-            for label_kind, tag_type_id in labels:
                 attempted_tag_count += 1
-                if tag_type_id is None:
+                vertical_tag_count += 1
+                if (not view_locked) or sym_vertical is None:
                     failed_real_tag_count += 1
                     continue
-                if label_kind == "vertical":
-                    anchor_pt = get_vertical_pipe_anchor_pt(pipe, view3d)
-                    head_pt = get_vertical_tag_head_pt(anchor_pt)
-                elif label_kind == "extra":
-                    anchor_pt, head_pt = get_exploded_extra_tag_points(pipe, view3d)
-                    head_pt = clamp_head_near_anchor(anchor_pt, head_pt, 180.0)
-                else:
-                    anchor_pt, head_pt = get_exploded_regular_tag_points(pipe, view3d)
-                    head_pt = clamp_head_near_anchor(anchor_pt, head_pt, 220.0)
-                print(
-                    "3D EXPLODED TAG -> host={} type_id={} point=({}, {}, {})".format(
-                        pipe.Id.IntegerValue,
-                        tag_type_id.IntegerValue,
-                        round(head_pt.X, 4),
-                        round(head_pt.Y, 4),
-                        round(head_pt.Z, 4),
+                try:
+                    bb = pipe.get_BoundingBox(view3d)
+                    anchor_pt = (
+                        XYZ(
+                            (bb.Min.X + bb.Max.X) * 0.5,
+                            (bb.Min.Y + bb.Max.Y) * 0.5,
+                            bb.Max.Z,
+                        )
+                        if bb
+                        else _midpoint_or_center(pipe, view3d)
                     )
-                )
+                except Exception:
+                    anchor_pt = _midpoint_or_center(pipe, view3d)
+                head_pt = get_vertical_tag_head_pt(anchor_pt)
                 tag = create_3d_pipe_tag(
                     doc,
                     view3d,
                     pipe,
-                    tag_type_id,
+                    sym_vertical.Id,
                     head_pt,
                     elbow_pt=None,
                     end_pt=None,
@@ -3091,6 +3241,79 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
                 except Exception:
                     pass
                 successful_real_tag_count += 1
+                displaced_vertical_tags += 1
+                print(
+                    "EXP PIPE TAG",
+                    pipe.Id.IntegerValue,
+                    "host:",
+                    anchor_pt,
+                    "text:",
+                    head_pt,
+                    "vertical:",
+                    True,
+                )
+                continue
+
+            labels = [
+                ("regular", sym_regular, get_regular_pipe_tag_text(pipe, code_map))
+            ]
+            regular_tag_count += 1
+            if pipe.Id.IntegerValue in extra_targets:
+                labels.append(
+                    ("extra", sym_extra, get_extra_horizontal_tag_text(pipe, code_map))
+                )
+                extra_tag_count += 1
+            for label_kind, sym, _label in labels:
+                attempted_tag_count += 1
+                if sym is None:
+                    failed_real_tag_count += 1
+                    continue
+                anchor_pt = get_exploded_visible_anchor_pt(pipe, view3d)
+                dir_xy = get_curve_direction_xy(pipe)
+                side = get_short_side_vector_xy(dir_xy)
+                offset_mm = 220.0 if label_kind == "regular" else 260.0
+                up_mm = 90.0 if label_kind == "regular" else 120.0
+                head_pt = XYZ(
+                    anchor_pt.X + side.X * mm_to_ft(offset_mm),
+                    anchor_pt.Y + side.Y * mm_to_ft(offset_mm),
+                    anchor_pt.Z + mm_to_ft(up_mm),
+                )
+                host_bb = pipe.get_BoundingBox(view3d)
+                if host_bb:
+                    host_rect = expand_rect(bbox_rect(host_bb), 60.0)
+                    tries = 0
+                    while rects_overlap(text_rect(head_pt), host_rect) and tries < 3:
+                        offset_mm += 70.0
+                        head_pt = XYZ(
+                            anchor_pt.X + side.X * mm_to_ft(offset_mm),
+                            anchor_pt.Y + side.Y * mm_to_ft(offset_mm),
+                            anchor_pt.Z + mm_to_ft(up_mm),
+                        )
+                        tries += 1
+                tag = create_3d_pipe_tag(
+                    doc,
+                    view3d,
+                    pipe,
+                    sym.Id,
+                    head_pt,
+                    elbow_pt=None,
+                    end_pt=None,
+                    use_leader=True,
+                )
+                if tag is None:
+                    failed_real_tag_count += 1
+                    continue
+                try:
+                    tag.HasLeader = True
+                except Exception:
+                    pass
+                try:
+                    tag.TagHeadPosition = head_pt
+                except Exception:
+                    pass
+                successful_real_tag_count += 1
+                adjusted_pipe_tags += 1
+                occupied_pipe_label_rects.append(text_rect(head_pt))
                 dist_mm = (
                     math.sqrt(
                         (head_pt.X - anchor_pt.X) * (head_pt.X - anchor_pt.X)
@@ -3101,9 +3324,90 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
                 )
                 if len(sample_head_distances) < 5:
                     sample_head_distances.append(round(dist_mm, 1))
-                if label_kind == "vertical":
-                    print("3D TAG -> vertical on-host:", pipe.Id.IntegerValue)
+                print(
+                    "EXP PIPE TAG",
+                    pipe.Id.IntegerValue,
+                    "host:",
+                    anchor_pt,
+                    "text:",
+                    head_pt,
+                    "vertical:",
+                    False,
+                )
+
+        fitting_groups = fitting_groups_from_fittings(fittings)
+        print("3D EXPLODED -> fitting groups:", len(fitting_groups))
+        print("EXPLODED 3D -> fitting clusters detected:", len(fitting_groups))
+        occupied_fitting_rects = []
+        fitting_numbering_skipped = False
+        for idx, group in enumerate(fitting_groups, 1):
+            member_ids = [fit.Id.IntegerValue for fit, _, _ in group]
+            anchor_pt = XYZ(
+                sum(ctr.X for _, _, ctr in group) / float(len(group)),
+                sum(ctr.Y for _, _, ctr in group) / float(len(group)),
+                sum(ctr.Z for _, _, ctr in group) / float(len(group)),
+            )
+            fit_rect = (
+                min(bb.Min.X for _, bb, _ in group),
+                min(bb.Min.Y for _, bb, _ in group),
+                max(bb.Max.X for _, bb, _ in group),
+                max(bb.Max.Y for _, bb, _ in group),
+            )
+            print("FIT NUM", idx, "fitting anchor:", anchor_pt, "final:", anchor_pt)
+            final_pt = None
+            final_rect = None
+            for radius_mm in [60, 90, 120, 150, 190]:
+                for ang in [0, 45, 90, 135, 180, 225, 270, 315]:
+                    rad = math.radians(ang)
+                    cand = XYZ(
+                        anchor_pt.X + math.cos(rad) * mm_to_ft(radius_mm),
+                        anchor_pt.Y + math.sin(rad) * mm_to_ft(radius_mm),
+                        anchor_pt.Z,
+                    )
+                    cand_rect = text_rect(cand)
+                    if rects_overlap(cand_rect, fit_rect):
+                        continue
+                    if any(rects_overlap(cand_rect, r) for r in occupied_fitting_rects):
+                        continue
+                    if any(
+                        rects_overlap(cand_rect, r) for r in occupied_pipe_label_rects
+                    ):
+                        continue
+                    inside_pipe = False
+                    for prect in pipe_bbox_rects:
+                        if rects_overlap(cand_rect, prect):
+                            inside_pipe = True
+                            break
+                    if inside_pipe:
+                        continue
+                    fit_pts = [ctr for _, _, ctr in group]
+                    if nearest_dist(cand, pipe_midpoints) <= nearest_dist(
+                        cand, fit_pts
+                    ):
+                        continue
+                    final_pt = cand
+                    final_rect = cand_rect
+                    break
+                if final_pt is not None:
+                    break
+            if final_pt is None or nt is None:
+                print("3D EXPLODED -> fitting number skipped:", idx)
+                fitting_numbering_skipped = True
+                continue
+            print("FIT NUM", idx, "fitting anchor:", anchor_pt, "final:", final_pt)
+            try:
+                TextNote.Create(
+                    doc, view3d.Id, final_pt, str(idx), TextNoteOptions(nt.Id)
+                )
+                occupied_fitting_rects.append(final_rect)
+                fitting_number_count += 1
+            except Exception:
+                print("3D EXPLODED -> fitting number skipped:", idx)
+                fitting_numbering_skipped = True
         t.Commit()
+    if fitting_numbering_skipped:
+        print("EXPLODED FITTING NUMBERING SKIPPED")
+
     print("FINAL 3D EXPLODED -> locked:", view_locked)
     print("FINAL 3D EXPLODED -> attempted tag count:", attempted_tag_count)
     print(
@@ -3113,15 +3417,24 @@ def annotate_exploded_3d_with_real_tags(doc, view3d, scanned_elems, code_map):
     print("FINAL 3D EXPLODED -> excluded NLRS pipe count:", excluded_nlrs_pipe_count)
     print("FINAL 3D EXPLODED -> vertical tag count:", vertical_tag_count)
     print("FINAL 3D EXPLODED -> regular tag count:", regular_tag_count)
+    print("EXPLODED 3D -> pipe tags adjusted:", adjusted_pipe_tags)
+    print("EXPLODED 3D -> vertical pipe tags preserved:", displaced_vertical_tags)
+    print("3D EXPLODED -> displaced vertical tags:", displaced_vertical_tags)
+    print("3D EXPLODED -> fitting numbers placed:", fitting_number_count)
+    print("FIT NUMBERS -> total placed:", fitting_number_count)
     return {
         "tags": successful_real_tag_count,
+        "text": text_count,
         "mode": "tags" if successful_real_tag_count > 0 else "none",
         "excluded_nlrs": excluded_nlrs_pipe_count,
         "attempted": attempted_tag_count,
         "failed": failed_real_tag_count,
-        "vertical_real": vertical_tag_count,
+        "vertical_real": displaced_vertical_tags,
+        "vertical_onhost": displaced_vertical_tags,
         "regular_real": regular_tag_count,
+        "regular_leader": regular_tag_count,
         "extra_real": extra_tag_count,
+        "extra_leader": extra_tag_count,
         "sample_head_distances": sample_head_distances,
     }
 
@@ -3410,6 +3723,9 @@ def apply_prefab_changes_to_view(
     text_note_done = False
     original_template_id = None
     template_detached = False
+    occupied_nonvert_heads = []
+    nonvertical_adjusted = 0
+    vertical_preserved = 0
     t = Transaction(doc, "Apply prefab tags/text")
     try:
         t.Start()
@@ -3533,12 +3849,20 @@ def apply_prefab_changes_to_view(
                         tag.HasLeader = True
                     except Exception:
                         pass
-                if use_offset_mm and use_offset_mm > 0:
-                    off = view_offset_vector(target_view, use_offset_mm)
+                if is_vert:
+                    vertical_preserved += 1
+                elif use_offset_mm and use_offset_mm > 0:
+                    head_pt = choose_plan_tag_head(
+                        p,
+                        target_view,
+                        pt,
+                        max(320, use_offset_mm),
+                        occupied_nonvert_heads,
+                    )
                     try:
-                        tag.TagHeadPosition = XYZ(
-                            pt.X + off.X, pt.Y + off.Y, pt.Z + off.Z
-                        )
+                        tag.TagHeadPosition = head_pt
+                        occupied_nonvert_heads.append(head_pt)
+                        nonvertical_adjusted += 1
                     except Exception:
                         pass
                 if host_tags:
@@ -3588,9 +3912,15 @@ def apply_prefab_changes_to_view(
                 except Exception:
                     pass
                 try:
-                    extra_tag.TagHeadPosition = XYZ(
-                        pt.X + off.X, pt.Y + off.Y, pt.Z + off.Z
+                    head_pt = choose_plan_tag_head(
+                        pipe,
+                        target_view,
+                        pt,
+                        max(340, TAGCFG_EXTRA_H.get("offset_mm", 350)),
+                        occupied_nonvert_heads,
                     )
+                    extra_tag.TagHeadPosition = head_pt
+                    occupied_nonvert_heads.append(head_pt)
                 except Exception:
                     pass
                 created_extra_count += 1
@@ -3607,6 +3937,8 @@ def apply_prefab_changes_to_view(
                 kept_count, created_count, recreated_count, deleted_count, remove_count
             )
         )
+        print("FLOOR PLAN -> nonvertical tags adjusted:", nonvertical_adjusted)
+        print("FLOOR PLAN -> vertical tags preserved:", vertical_preserved)
         print("FLOOR PLAN -> extra horizontal tag created:", created_extra_count)
         t.Commit()
         print("APPLY PREFAB -> transaction committed")
