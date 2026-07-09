@@ -134,6 +134,10 @@ ANNOTATE_3D = True
 ANNOTATE_3D_MODE = "TEXT"
 DUPLICATE_ONLY_RELEVANT_SCHEDULES = True
 SKIP_EMPTY_SCHEDULES = True
+# Scales only 2D floor plan pipe tag leader/head offset distance.
+# 1.0 = old distance, 0.5 = half distance.
+PLAN_TAG_LEADER_OFFSET_SCALE = 0.9
+_PLAN_TAG_OFFSET_DEBUG_COUNT = 0
 
 
 def debug(*args):
@@ -1537,6 +1541,60 @@ def get_region_bounding_box(elements):
     return overall_min, overall_max
 
 
+def apply_plan_pipe_tag_head_offset(tag, pipe, view, anchor):
+    global _PLAN_TAG_OFFSET_DEBUG_COUNT
+    try:
+        if isinstance(view, View3D):
+            return
+    except Exception:
+        pass
+    try:
+        right = view.RightDirection
+        up = view.UpDirection
+    except Exception:
+        right = XYZ(1, 0, 0)
+        up = XYZ(0, 1, 0)
+    try:
+        loc = pipe.Location
+        if loc and hasattr(loc, "Curve") and loc.Curve:
+            p0 = loc.Curve.GetEndPoint(0)
+            p1 = loc.Curve.GetEndPoint(1)
+            vx = p1.X - p0.X
+            vy = p1.Y - p0.Y
+            mag = math.sqrt(vx * vx + vy * vy)
+            if mag > 1e-9:
+                right = XYZ(-vy / mag, vx / mag, 0)
+    except Exception:
+        pass
+    base_offset_ft = 0.80
+    up_offset_ft = 0.20
+    old_target = XYZ(
+        anchor.X + right.X * base_offset_ft + up.X * up_offset_ft,
+        anchor.Y + right.Y * base_offset_ft + up.Y * up_offset_ft,
+        anchor.Z + right.Z * base_offset_ft + up.Z * up_offset_ft,
+    )
+    new_target = XYZ(
+        anchor.X + (old_target.X - anchor.X) * PLAN_TAG_LEADER_OFFSET_SCALE,
+        anchor.Y + (old_target.Y - anchor.Y) * PLAN_TAG_LEADER_OFFSET_SCALE,
+        anchor.Z + (old_target.Z - anchor.Z) * PLAN_TAG_LEADER_OFFSET_SCALE,
+    )
+    try:
+        tag.HasLeader = True
+    except Exception:
+        pass
+    try:
+        tag.TagHeadPosition = new_target
+    except Exception:
+        pass
+    if _PLAN_TAG_OFFSET_DEBUG_COUNT == 0:
+        print("PLAN TAG OFFSET -> scale:", PLAN_TAG_LEADER_OFFSET_SCALE)
+    if _PLAN_TAG_OFFSET_DEBUG_COUNT < 5:
+        print("PLAN TAG OFFSET -> pipe id:", pipe.Id.IntegerValue)
+        print("PLAN TAG OFFSET -> old target:", old_target)
+        print("PLAN TAG OFFSET -> new target:", new_target)
+    _PLAN_TAG_OFFSET_DEBUG_COUNT += 1
+
+
 def create_pipe_tags_for_untagged_pipes(doc, pipes, view):
     t = Transaction(doc, "Add Missing Pipe Tags")
     t.Start()
@@ -1550,7 +1608,7 @@ def create_pipe_tags_for_untagged_pipes(doc, pipes, view):
             (bbox.Min.Z + bbox.Max.Z) / 2.0,
         )
         pipe_ref = Reference(pipe)
-        IndependentTag.Create(
+        tag = IndependentTag.Create(
             doc,
             view.Id,
             pipe_ref,
@@ -1559,6 +1617,7 @@ def create_pipe_tags_for_untagged_pipes(doc, pipes, view):
             TagOrientation.Horizontal,
             UV(center.X, center.Y),
         )
+        apply_plan_pipe_tag_head_offset(tag, pipe, view, center)
     t.Commit()
 
 
@@ -2221,6 +2280,16 @@ class ElementEditorForm(Form):
                         TagOrientation.Horizontal,
                         ctr,
                     )
+            try:
+                if new_tag:
+                    apply_plan_pipe_tag_head_offset(
+                        new_tag,
+                        host,
+                        doc.ActiveView,
+                        get_element_annotation_point(host, doc.ActiveView),
+                    )
+            except Exception:
+                pass
             try:
                 tp = new_tag.LookupParameter("Comments") if new_tag else None
                 if tp and not tp.IsReadOnly and row_new_code:
