@@ -1,0 +1,8 @@
+title: "Sheet\nGenerator"
+tooltip: |
+  BvdK 2.0 prefab sheet generator.
+
+  Select a closed boundary region, edit prefab codes, place tags,
+  fix reducers, flip T-stuk fittings, and create prefab sheets.
+
+author: "BIMCode Solutions / Emin Avdovic"
